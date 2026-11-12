@@ -10,6 +10,15 @@ uv sync
 
 Google sign-in needs an OAuth client file (Desktop app) at `Secrets/client_secret.json`.
 
+## App window
+
+```bash
+uv run schedule-optimizer-app             # native window
+uv run schedule-optimizer-app --browser   # same UI in a browser tab (http://127.0.0.1:8765)
+```
+
+The first launch walks through setup: your day, Google sign-in, and which calendars block time.
+
 ## Command line
 
 ```bash

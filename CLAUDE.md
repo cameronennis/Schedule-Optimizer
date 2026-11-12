@@ -41,6 +41,8 @@ A local desktop app that reads Google Calendar, takes tasks with weights, and us
 - Publishing to "In production" requires the Branding page: app name, support email, developer email, a home page URL (GitHub repo, with `github.com` as an authorized domain) and a privacy policy URL (`PRIVACY.md` in the repo). Don't upload a logo; that forces verification.
 - The Google Calendar API must be enabled separately in the Cloud project, or calls fail with 403 `accessNotConfigured`.
 - Use `singleEvents=True` when listing events so recurring lectures come back as separate instances.
+- NiceGUI is v4. Always pass `host="127.0.0.1"` to `ui.run` (the default in browser mode listens on the whole network). Async `@ui.refreshable` sections must be awaited; from sync code use `ui_app.load_later`. UI tests use `nicegui.testing.user_simulation(root=...)` with pytest-asyncio.
+- The desktop app's preview runner (`preview_start`) hangs on this project; to eyeball the UI, run a script with `.venv/bin/python` in the background and open http://127.0.0.1:8765 in the built-in browser.
 - Don't build a custom "Sign in with Claude." Anthropic doesn't allow third-party apps to collect Claude.ai credentials or route requests through subscriptions. API-key mode uses a key from the Claude Console stored in keyring.
 
 ## Still open

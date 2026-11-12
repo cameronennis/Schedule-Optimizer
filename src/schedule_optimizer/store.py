@@ -119,7 +119,7 @@ def _validate_task(t: Task) -> None:
 def add_task(s: Session, **fields) -> Task:
     if fields.get("weekly_minutes") and "effort_mode" not in fields:
         fields["effort_mode"] = EffortMode.WEEKLY
-    task = Task(**fields)
+    task = Task.model_validate(fields)  # also turns strings like "evening" into enums
     _validate_task(task)
     s.add(task)
     s.commit()
@@ -131,10 +131,12 @@ def update_task(s: Session, task_id: int, **changes) -> Task:
     task = s.get(Task, task_id)
     if task is None:
         raise KeyError(f"no task with id {task_id}")
-    for k, v in changes.items():
+    for k in changes:
         if k in ("id", "created_at") or k not in Task.model_fields:
             raise ValueError(f"can't set {k!r}")
-        setattr(task, k, v)
+    validated = Task.model_validate({**task.model_dump(), **changes})
+    for k in changes:
+        setattr(task, k, getattr(validated, k))
     _validate_task(task)
     s.add(task)
     s.commit()
@@ -226,6 +228,18 @@ def set_event_meta(s: Session, google_event_id: str, skippable: bool, skip_cost:
     return meta
 
 
+def clear_event_meta(s: Session, google_event_id: str) -> None:
+    """Forget per-event settings so title rules apply again."""
+    meta = s.get(EventMeta, google_event_id)
+    if meta is not None:
+        s.delete(meta)
+        s.commit()
+
+
+def event_metas(s: Session) -> dict[str, EventMeta]:
+    return {m.google_event_id: m for m in s.exec(select(EventMeta))}
+
+
 def apply_event_settings(s: Session, events: list[EventInput]) -> list[EventInput]:
     """Mark events skippable: per-event settings first, then the first matching title rule."""
     rules = list_title_rules(s)
@@ -288,6 +302,15 @@ def plan_now(s: Session, busy_events: list[EventInput], now: datetime) -> Plan:
 
 def proposed_blocks(s: Session) -> list[PlanBlock]:
     return list(s.exec(select(PlanBlock).where(PlanBlock.status == BlockStatus.PROPOSED).order_by(PlanBlock.start)))
+
+
+def upcoming_blocks(s: Session, now: datetime) -> list[PlanBlock]:
+    """Blocks to show: the proposed plan if there is one, else approved blocks that haven't ended."""
+    proposed = proposed_blocks(s)
+    if proposed:
+        return [b for b in proposed if b.end > now]
+    q = select(PlanBlock).where(PlanBlock.status == BlockStatus.APPROVED, PlanBlock.end > now)
+    return list(s.exec(q.order_by(PlanBlock.start)))
 
 
 def approve_plan(s: Session) -> int:

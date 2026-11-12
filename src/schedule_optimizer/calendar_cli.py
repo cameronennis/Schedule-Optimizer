@@ -11,10 +11,11 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timedelta
 
-from . import google_auth, local_config
+from . import db, google_auth, store
+from .calendar_sync import busy_events
 from .demo import print_plan
-from .domain import Preferences, TaskInput, TimeOfDay, WeeklyTask
-from .gcal import CalendarInfo, calendar_service, fetch_events, list_calendars, user_time_zone
+from .domain import TaskInput, TimeOfDay, WeeklyTask
+from .gcal import CalendarInfo, calendar_service, list_calendars
 from .solver import solve
 
 
@@ -66,21 +67,15 @@ def main() -> None:
     print("Signed in (new sign-in)." if first_time else "Signed in from saved Keychain token — no browser needed.")
 
     service = calendar_service(creds)
-    calendars = list_calendars(service)
-    tz = user_time_zone(calendars)
-
-    busy = local_config.busy_calendar_ids()
-    known = {c.id for c in calendars}
-    if args.pick or not busy or not set(busy) & known:
-        busy = pick_calendars(calendars)
-        local_config.set_busy_calendar_ids(busy)
-    busy = [b for b in busy if b in known]
-    names = {c.id: c.name for c in calendars}
-    print("Busy calendars: " + ", ".join(names[b] for b in busy))
-
-    prefs = Preferences()
-    now = datetime.now(tz)
-    events = fetch_events(service, busy, now, now + timedelta(days=prefs.horizon_days))
+    with db.session() as s:
+        store.import_legacy_settings(s)
+        now = datetime.now(store.local_tz(store.get_prefs(s)))
+        events = busy_events(s, now, service=service, choose=pick_calendars, force_choose=args.pick)
+        db_prefs = store.get_prefs(s)
+        tz = store.local_tz(db_prefs)
+        prefs = store.solver_prefs(db_prefs)
+        names = {c.id: c.name for c in list_calendars(service)}
+        print("Busy calendars: " + ", ".join(names.get(b, b) for b in db_prefs.busy_calendars))
 
     print(f"\nNext {prefs.horizon_days} days ({tz}): {len(events)} busy events\n")
     day = None

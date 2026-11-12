@@ -4,8 +4,8 @@ A local desktop app that reads Google Calendar, takes tasks with weights, and us
 
 ## How to work with me
 
-- This is a learning project. Before using a new tool or library, explain what it does, why it's here, and how it connects to the rest. Build in small runnable steps; don't generate whole phases at once.
-- Follow the phases in `docs/PLAN.md` in order. Each phase ends with a checkpoint I can run myself. Stop at the checkpoint and let me run it.
+- Claude does most of the work. Build whole phases at a time, in the order in `docs/PLAN.md`, with pytest tests, and run them yourself.
+- Stop only where I'm needed: Google sign-in, restarting Claude Desktop, pasting TwiceDaily, decisions. Tell me each phase's checkpoint command so I can try it.
 - Keep answers brief. Don't answer questions I didn't ask.
 - Use American English spellings.
 
@@ -20,6 +20,12 @@ A local desktop app that reads Google Calendar, takes tasks with weights, and us
 - The app writes only to its own "Optimizer" Google calendar, never to real ones.
 - Claude never places blocks. It changes solver inputs, I approve, CP-SAT re-plans.
 - Claude has three modes: off (default, offline), Claude Desktop, and API key.
+- Plan blocks are written to the Optimizer calendar only after I click "Approve plan."
+- Preferences (awake window 8:00–23:00, 6 h max focus/day, 5-min buffer, 7-day horizon) have defaults but are editable in a first-run setup step and in Preferences.
+- Event title rules (e.g., "Lecture" → skippable, cost 4) have no built-in defaults. I create them by manual entry or through Claude.
+- No phone access and no hosted version.
+- Google OAuth client file lives at `Secrets/client_secret.json` (capital S, gitignored). Never print or commit it.
+- Urgency is a small "earlier is better" nudge for deadline tasks, not a multiplier on points per hour, so skip-cost math stays in plain points per hour.
 - Platform: macOS first. Keep Windows possible throughout (no macOS-only paths, APIs, or shell assumptions without a cross-platform fallback), but don't implement Windows support yet.
 
 ## Claude Desktop mode
@@ -37,4 +43,5 @@ A local desktop app that reads Google Calendar, takes tasks with weights, and us
 
 ## Still open
 
+- Which Google calendars count as busy (block time). Show me the list after sign-in and let me pick.
 - What TwiceDaily (my Google Apps Script) does today, and its weather source. I'll paste it when we reach the TwiceDaily phase.

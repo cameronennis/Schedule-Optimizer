@@ -38,6 +38,8 @@ A local desktop app that reads Google Calendar, takes tasks with weights, and us
 ## Gotchas found so far
 
 - Google OAuth consent screen must be "In production," not "Testing," or refresh tokens expire after 7 days. The unverified-app warning is fine for personal use.
+- Publishing to "In production" requires the Branding page: app name, support email, developer email, a home page URL (GitHub repo, with `github.com` as an authorized domain) and a privacy policy URL (`PRIVACY.md` in the repo). Don't upload a logo; that forces verification.
+- The Google Calendar API must be enabled separately in the Cloud project, or calls fail with 403 `accessNotConfigured`.
 - Use `singleEvents=True` when listing events so recurring lectures come back as separate instances.
 - Don't build a custom "Sign in with Claude." Anthropic doesn't allow third-party apps to collect Claude.ai credentials or route requests through subscriptions. API-key mode uses a key from the Claude Console stored in keyring.
 

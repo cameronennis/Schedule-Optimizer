@@ -29,7 +29,8 @@ uv run schedule-optimizer log 1 45            # 45 minutes on task 1, ending now
 uv run schedule-optimizer rule add Lecture --cost 4
 uv run schedule-optimizer events              # upcoming events and how they're treated
 uv run schedule-optimizer plan                # solve against your calendar (or --offline)
-uv run schedule-optimizer approve
+uv run schedule-optimizer approve             # also writes blocks to your "Optimizer" calendar
+uv run schedule-optimizer sync                # rewrite approved blocks to Google
 uv run schedule-optimizer prefs show
 ```
 

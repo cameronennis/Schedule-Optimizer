@@ -80,11 +80,11 @@ def test_migrations_run_once_on_old_files(db_file, monkeypatch):
     def add_color(conn):
         conn.execute(text("ALTER TABLE task ADD COLUMN color VARCHAR"))
 
-    monkeypatch.setattr(db, "MIGRATIONS", [add_color])
+    monkeypatch.setattr(db, "MIGRATIONS", [*db.MIGRATIONS, add_color])
     db.make_engine(db_file).dispose()
     db.make_engine(db_file).dispose()  # second open must not re-run it
     conn = sqlite3.connect(db_file)
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == 2
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION + 1
     assert "color" in [r[1] for r in conn.execute("PRAGMA table_info(task)")]
 
 
@@ -249,5 +249,5 @@ def test_cli_offline_plan(cli_db, capsys):
     cli.main(["task", "add", "Essay", "--hours", "2"])
     cli.main(["plan", "--offline"])
     assert "Essay" in capsys.readouterr().out
-    cli.main(["approve"])
+    cli.main(["approve", "--no-sync"])
     assert "Approved" in capsys.readouterr().out

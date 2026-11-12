@@ -43,7 +43,8 @@ def get_prefs(s: Session) -> Preferences:
 PREF_FIELDS = {
     "awake_start", "awake_end", "max_focus_minutes_per_day", "buffer_minutes", "horizon_days",
     "time_zone", "busy_calendars", "claude_mode", "setup_complete",
-    "chunk_cost", "ideal_deviation_per_hour", "time_of_day_bonus_per_hour",
+    "chunk_cost", "ideal_deviation_per_hour", "time_of_day_bonus_per_hour", "stability_per_hour",
+    "optimizer_calendar_id",
 }
 
 
@@ -79,6 +80,7 @@ def solver_prefs(prefs: Preferences) -> domain.Preferences:
         chunk_cost=prefs.chunk_cost,
         ideal_deviation_per_hour=prefs.ideal_deviation_per_hour,
         time_of_day_bonus_per_hour=prefs.time_of_day_bonus_per_hour,
+        stability_per_hour=prefs.stability_per_hour,
     )
 
 
@@ -294,7 +296,10 @@ def plan_now(s: Session, busy_events: list[EventInput], now: datetime) -> Plan:
     prefs = get_prefs(s)
     tasks, weekly = solver_inputs(s, now)
     events = apply_event_settings(s, busy_events)
-    plan = solve(tasks, events, solver_prefs(prefs), now, weekly=weekly)
+    previous: dict[str, list[tuple[datetime, datetime]]] = {}
+    for b in approved_blocks(s, now):
+        previous.setdefault(str(b.task_id), []).append((b.start, b.end))
+    plan = solve(tasks, events, solver_prefs(prefs), now, weekly=weekly, previous=previous)
     if plan.status in ("OPTIMAL", "FEASIBLE"):
         save_proposed_plan(s, plan)
     return plan
@@ -302,6 +307,14 @@ def plan_now(s: Session, busy_events: list[EventInput], now: datetime) -> Plan:
 
 def proposed_blocks(s: Session) -> list[PlanBlock]:
     return list(s.exec(select(PlanBlock).where(PlanBlock.status == BlockStatus.PROPOSED).order_by(PlanBlock.start)))
+
+
+def approved_blocks(s: Session, now: datetime | None = None) -> list[PlanBlock]:
+    """Approved blocks, optionally only those that haven't ended by `now`."""
+    q = select(PlanBlock).where(PlanBlock.status == BlockStatus.APPROVED)
+    if now is not None:
+        q = q.where(PlanBlock.end > now)
+    return list(s.exec(q.order_by(PlanBlock.start)))
 
 
 def upcoming_blocks(s: Session, now: datetime) -> list[PlanBlock]:

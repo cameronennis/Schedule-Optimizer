@@ -33,8 +33,9 @@ def busy_events(
     without it, CalendarsNotChosen is raised instead.
     """
     service = service or connect()
-    calendars = list_calendars(service)
     prefs = store.get_prefs(s)
+    # The app's own Optimizer calendar never counts as busy (it holds the plan itself).
+    calendars = [c for c in list_calendars(service) if c.id != prefs.optimizer_calendar_id]
     if prefs.time_zone is None:
         tz = user_time_zone(calendars)
         if hasattr(tz, "key"):

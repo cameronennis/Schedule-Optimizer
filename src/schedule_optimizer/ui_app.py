@@ -13,7 +13,7 @@ from datetime import datetime, time, timedelta
 
 from nicegui import run, ui
 
-from . import db, google_auth, store
+from . import db, google_auth, optimizer_cal, store
 from .calendar_sync import CalendarsNotChosen, busy_events, connect
 from .domain import EventInput, Plan, TimeOfDay
 from .gcal import list_calendars
@@ -130,6 +130,8 @@ class PrefsForm:
                                                               value=p.ideal_deviation_per_hour, step=0.5, min=0),
                         "time_of_day_bonus_per_hour": ui.number("Preferred time bonus per hour",
                                                                 value=p.time_of_day_bonus_per_hour, step=0.5, min=0),
+                        "stability_per_hour": ui.number("Re-plan: per hour a block stays put",
+                                                        value=p.stability_per_hour, step=0.5, min=0),
                     }
 
     def save(self) -> bool:
@@ -204,7 +206,9 @@ async def _calendar_picker() -> None:
         return
     spinner.delete()
     with db.session() as s:
-        chosen = set(store.get_prefs(s).busy_calendars)
+        prefs = store.get_prefs(s)
+        chosen = set(prefs.busy_calendars)
+    calendars = [c for c in calendars if c.id != prefs.optimizer_calendar_id]
     if not chosen:  # suggest calendars you own or can edit
         chosen = {c.id for c in calendars if c.access_role in ("owner", "writer")}
         with db.session() as s:
@@ -258,11 +262,31 @@ async def replan() -> None:
     now_view.refresh()
 
 
-def approve() -> None:
+def _approve(write_to_google: bool):
     with db.session() as s:
-        count = store.approve_plan(s)
-    ui.notify(f"Approved {count} blocks." if count else "Nothing to approve.",
-              type="positive" if count else "info")
+        service = connect(interactive=False) if write_to_google else None
+        return optimizer_cal.approve_and_sync(s, service)
+
+
+async def approve() -> None:
+    to_google = google_auth.is_signed_in()
+    n = ui.notification("Approving…" + (" and writing to your Optimizer calendar" if to_google else ""),
+                        spinner=True, timeout=None)
+    try:
+        count, result = await run.io_bound(_approve, to_google)
+    except Exception as e:  # noqa: BLE001
+        n.dismiss()
+        notify_error(e)
+        now_view.refresh()
+        return
+    n.dismiss()
+    if not count:
+        ui.notify("Nothing to approve.")
+    elif result:
+        ui.notify(f"Approved {count} blocks. Optimizer calendar: {result.inserted} added, "
+                  f"{result.deleted} removed, {result.kept} unchanged.", type="positive")
+    else:
+        ui.notify(f"Approved {count} blocks (offline, so nothing was written to Google).", type="positive")
     now_view.refresh()
 
 
@@ -311,7 +335,7 @@ def now_view() -> None:
     with ui.row().classes("items-center gap-2"):
         ui.button("Re-plan", icon="auto_awesome", on_click=replan).mark("replan")
         ui.button("Approve plan", icon="check", on_click=approve).mark("approve") \
-            .props("" if has_proposed else "disable").tooltip("Saves this plan; Phase 6 writes it to your Optimizer calendar")
+            .props("" if has_proposed else "disable").tooltip("Saves this plan and writes it to your Optimizer calendar")
         ui.button("Log progress", icon="timer", on_click=lambda: open_log_dialog()).props("outline").mark("log")
         ui.label("Using Google Calendar" if _use_google() else "Offline: Google Calendar not used") \
             .classes("text-sm text-gray-500 ml-2")

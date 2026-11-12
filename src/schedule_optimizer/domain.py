@@ -91,6 +91,7 @@ class Preferences:
     chunk_cost: float = 1.0  # f: fixed cost per block, discourages fragmenting
     ideal_deviation_per_hour: float = 1.0  # a: per hour a block differs from ideal_block
     time_of_day_bonus_per_hour: float = 1.0  # b: per hour inside the preferred window
+    stability_per_hour: float = 1.0  # per hour a block stays where the last approved plan put it
     solve_seconds: float = 5.0
 
 

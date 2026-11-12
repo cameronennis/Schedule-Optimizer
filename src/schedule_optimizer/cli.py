@@ -8,7 +8,7 @@
     uv run schedule-optimizer events                   # upcoming events and how they're treated
     uv run schedule-optimizer event set <id> --skippable --cost 8
     uv run schedule-optimizer plan                     # solve with your real calendar
-    uv run schedule-optimizer approve
+    uv run schedule-optimizer approve              # also writes to your Optimizer calendar
     uv run schedule-optimizer prefs show
     uv run schedule-optimizer prefs set max_focus_minutes_per_day=300 awake_start=07:30
     uv run schedule-optimizer calendars                # choose which calendars block time
@@ -22,7 +22,8 @@ from datetime import datetime, time, timedelta
 
 from . import db, store
 from .calendar_cli import pick_calendars
-from .calendar_sync import busy_events
+from . import google_auth, optimizer_cal
+from .calendar_sync import busy_events, connect
 from .demo import print_plan
 from .domain import TimeOfDay
 from .tables import ClaudeMode, EffortMode, Task, TaskStatus
@@ -168,9 +169,21 @@ def cmd_plan(args, s, tz):
         print("\nThis plan is proposed. Approve it with: schedule-optimizer approve")
 
 
+def _print_sync(result) -> None:
+    print(f"Optimizer calendar: {result.inserted} added, {result.deleted} removed, "
+          f"{result.trimmed} ended early, {result.kept} unchanged.")
+
+
 def cmd_approve(args, s, tz):
-    n = store.approve_plan(s)
+    service = None if args.no_sync or not google_auth.is_signed_in() else connect()
+    n, result = optimizer_cal.approve_and_sync(s, service)
     print(f"Approved {n} blocks." if n else "Nothing to approve; run `schedule-optimizer plan` first.")
+    if result:
+        _print_sync(result)
+
+
+def cmd_sync(args, s, tz):
+    _print_sync(optimizer_cal.sync_approved(connect(), s))
 
 
 def cmd_calendars(args, s, tz):
@@ -281,7 +294,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     plan = sub.add_parser("plan", help="solve and show a proposed plan")
     plan.add_argument("--offline", action="store_true", help="ignore Google Calendar")
-    sub.add_parser("approve", help="approve the proposed plan")
+    sub.add_parser("approve", help="approve the proposed plan and write it to the Optimizer calendar") \
+        .add_argument("--no-sync", action="store_true", help="approve without writing to Google")
+    sub.add_parser("sync", help="rewrite approved blocks to the Optimizer calendar")
     sub.add_parser("calendars", help="choose which calendars block time")
 
     prefs = sub.add_parser("prefs", help="show or change preferences")
@@ -292,7 +307,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 COMMANDS = {"task": cmd_task, "log": cmd_log, "rule": cmd_rule, "events": cmd_events, "event": cmd_event,
-            "plan": cmd_plan, "approve": cmd_approve, "calendars": cmd_calendars, "prefs": cmd_prefs}
+            "plan": cmd_plan, "approve": cmd_approve, "sync": cmd_sync, "calendars": cmd_calendars, "prefs": cmd_prefs}
 
 
 def main(argv: list[str] | None = None) -> None:

@@ -123,6 +123,8 @@ class Preferences(SQLModel, table=True):
     chunk_cost: float = 1.0
     ideal_deviation_per_hour: float = 1.0
     time_of_day_bonus_per_hour: float = 1.0
+    stability_per_hour: float = 1.0  # added in schema v2
+    optimizer_calendar_id: str | None = None  # the app's own Google calendar (schema v2)
 
 
 class ProgressLog(SQLModel, table=True):

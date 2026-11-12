@@ -57,6 +57,7 @@ class _Chunk:
     placed_len: cp_model.LinearExpr  # length if present, else 0
     deviation: cp_model.IntVar
     tod_len: cp_model.IntVar | None = None
+    stay: list = field(default_factory=list)  # overlap with previously approved blocks
 
 
 @dataclass
@@ -79,8 +80,15 @@ def _merge(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
 
 
 def build_model(
-    tasks: list[TaskInput], events: list[EventInput], prefs: Preferences, now: datetime
+    tasks: list[TaskInput],
+    events: list[EventInput],
+    prefs: Preferences,
+    now: datetime,
+    previous: dict[str, list[tuple[datetime, datetime]]] | None = None,
 ) -> _Model:
+    """`previous` maps a task id (weekly instances share their base id) to the blocks
+    the last approved plan gave it. Overlapping them earns a small stability bonus, so
+    a re-plan only moves blocks when that gains more than the bonus."""
     grid = TimeGrid.starting(now, prefs.horizon_days)
     m = cp_model.CpModel()
     out = _Model(model=m, grid=grid)
@@ -118,6 +126,7 @@ def build_model(
     f_units = round(prefs.chunk_cost * SCALE)
     a_units = _units_per_slot(prefs.ideal_deviation_per_hour)
     b_units = _units_per_slot(prefs.time_of_day_bonus_per_hour)
+    stay_units = _units_per_slot(prefs.stability_per_hour)
 
     for task in tasks:
         rem = minutes_to_slots(task.remaining_minutes)
@@ -141,6 +150,11 @@ def build_model(
             tod_windows = {d: grid.local_window(d, t_start, t_end) for d in days}
 
         w_units = _units_per_slot(task.points_per_hour)
+        prev_spans = []
+        for ps, pe in (previous or {}).get(task.id.split("@", 1)[0], []):
+            plo, phi = max(grid.clamp(grid.to_slot_floor(ps)), lo_b), min(grid.clamp(grid.to_slot_ceil(pe)), hi_b)
+            if plo < phi:
+                prev_spans.append((plo, phi))
         task_chunks: list[_Chunk] = []
         for k in range(k_max):
             name = f"{task.id}#{k}"
@@ -197,6 +211,27 @@ def build_model(
             objective.append(-f_units * p)
             if task.deadline:
                 objective.append(-EARLINESS_UNITS_PER_SLOT * s)
+
+            # Stability: reward overlap with this task's previously approved blocks.
+            # overlap = max(0, min(ends) − max(starts)); lo/hi are bounds the solver
+            # pushes tight because it's maximizing, and `gap` may be negative.
+            for plo, phi in prev_spans:
+                n = grid.num_slots
+                lo = m.new_int_var(0, n, "")
+                hi = m.new_int_var(0, n, "")
+                m.add(lo >= s)
+                m.add(lo >= plo)
+                m.add(hi <= s + length)
+                m.add(hi <= phi)
+                gap = m.new_int_var(-n, n, "")
+                m.add(gap == hi - lo)
+                pos = m.new_int_var(0, n, "")
+                m.add_max_equality(pos, [gap, 0])
+                ov = m.new_int_var(0, min(max_len, phi - plo), f"stay[{name}]")
+                m.add(ov <= pos)
+                m.add(ov <= max_len * p)
+                objective.append(stay_units * ov)
+                chunk.stay.append(ov)
             task_chunks.append(chunk)
 
         # Symmetry breaking: used chunks come first, in time order.
@@ -221,10 +256,11 @@ def solve(
     now: datetime,
     weekly: list[WeeklyTask] | None = None,
     num_workers: int = 8,
+    previous: dict[str, list[tuple[datetime, datetime]]] | None = None,
 ) -> Plan:
     grid = TimeGrid.starting(now, prefs.horizon_days)
     all_tasks = list(tasks) + [t for w in weekly or [] for t in expand_weekly(w, grid)]
-    built = build_model(all_tasks, events, prefs, now)
+    built = build_model(all_tasks, events, prefs, now, previous)
 
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = prefs.solve_seconds
@@ -248,6 +284,8 @@ def solve(
             "block_cost": -prefs.chunk_cost,
             "ideal_deviation": -prefs.ideal_deviation_per_hour * solver.value(c.deviation) / SLOTS_PER_HOUR,
         }
+        if c.stay:
+            score["stability_bonus"] = prefs.stability_per_hour * sum(solver.value(v) for v in c.stay) / SLOTS_PER_HOUR
         if c.tod_len is not None:
             score["time_of_day_bonus"] = prefs.time_of_day_bonus_per_hour * solver.value(c.tod_len) / SLOTS_PER_HOUR
         blocks.append(PlanBlock(c.task.id, c.task.title, grid.to_datetime(s), grid.to_datetime(s + length), score))

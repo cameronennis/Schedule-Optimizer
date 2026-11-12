@@ -21,8 +21,16 @@ from .paths import data_dir
 DB_FILENAME = "schedule.db"
 
 # Each migration takes a connection and upgrades the schema by one version.
-# Version 1 = the tables as first created by create_all().
-MIGRATIONS: list[Callable] = []
+# Version 1 = the tables as first created by create_all() in Phase 4.
+
+
+def _v1_to_v2(conn) -> None:
+    """Phase 6: re-plan stability weight and the Optimizer calendar's ID."""
+    conn.execute(text("ALTER TABLE preferences ADD COLUMN stability_per_hour FLOAT NOT NULL DEFAULT 1.0"))
+    conn.execute(text("ALTER TABLE preferences ADD COLUMN optimizer_calendar_id VARCHAR"))
+
+
+MIGRATIONS: list[Callable] = [_v1_to_v2]
 SCHEMA_VERSION = 1 + len(MIGRATIONS)
 
 

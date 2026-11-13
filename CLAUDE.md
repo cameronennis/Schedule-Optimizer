@@ -25,6 +25,7 @@ A local desktop app that reads Google Calendar, takes tasks with weights, and us
 - Event title rules (e.g., "Lecture" → skippable, cost 4) have no built-in defaults. I create them by manual entry or through Claude.
 - No phone access and no hosted version.
 - Google OAuth client file lives at `Secrets/client_secret.json` (capital S, gitignored). Never print or commit it.
+- A task's longest block (max_block) is soft: exceeding it costs 0.5 points per extra hour, less than any task's value, so deadlines and avoiding skips win. Blocks of the same task need at least 30 minutes between them (otherwise it's one longer block), as a fixed rule, not a preference.
 - Urgency is a small "earlier is better" nudge for deadline tasks, not a multiplier on points per hour, so skip-cost math stays in plain points per hour.
 - Platform: macOS first. Keep Windows possible throughout (no macOS-only paths, APIs, or shell assumptions without a cross-platform fallback), but don't implement Windows support yet.
 

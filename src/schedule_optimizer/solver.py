@@ -42,6 +42,9 @@ SLOTS_PER_HOUR = 60 // SLOT_MINUTES
 # week this is under 2 points, so it breaks ties without overriding real values.
 EARLINESS_UNITS_PER_SLOT = 1
 MAX_CHUNKS_PER_TASK = 40
+# Same-task blocks closer than this aren't really separate sessions, so the solver
+# must either leave a real break or make one longer block (max_block is soft).
+SAME_TASK_BREAK_MINUTES = 30
 
 
 def _units_per_slot(points_per_hour: float) -> int:
@@ -57,6 +60,7 @@ class _Chunk:
     placed_len: cp_model.LinearExpr  # length if present, else 0
     deviation: cp_model.IntVar
     tod_len: cp_model.IntVar | None = None
+    over: cp_model.IntVar | None = None  # slots beyond the soft max_block
     stay: list = field(default_factory=list)  # overlap with previously approved blocks
 
 
@@ -109,8 +113,14 @@ def build_model(
         return (lo, hi) if lo < hi else None
 
     fixed = [s for e in events if not e.skippable and (s := span(e))]
+    # Events short enough to sit inside a same-task break; an event between two blocks
+    # is itself the break, so those blocks may be closer than SAME_TASK_BREAK_MINUTES.
+    break_slots = max(buf, minutes_to_slots(SAME_TASK_BREAK_MINUTES))
+    short_events: list[tuple[int, int, cp_model.IntVar | None]] = []
     for lo, hi in _merge(fixed):
         intervals.append(m.new_fixed_size_interval_var(lo, hi - lo + buf, "fixed"))
+        if hi - lo + 2 * buf < break_slots:
+            short_events.append((lo, hi, None))
 
     for e in events:
         if not e.skippable or not (s := span(e)):
@@ -119,6 +129,8 @@ def build_model(
         attend = m.new_bool_var(f"attend[{e.id}]")
         out.attend[e.id] = attend
         intervals.append(m.new_optional_fixed_size_interval_var(lo, hi - lo + buf, attend, f"ev[{e.id}]"))
+        if hi - lo + 2 * buf < break_slots:
+            short_events.append((lo, hi, attend))  # only a break if attended
         cost = round(e.skip_cost * SCALE)
         objective.append(cost * attend - cost)  # lose skip_cost points if not attended
 
@@ -127,6 +139,7 @@ def build_model(
     a_units = _units_per_slot(prefs.ideal_deviation_per_hour)
     b_units = _units_per_slot(prefs.time_of_day_bonus_per_hour)
     stay_units = _units_per_slot(prefs.stability_per_hour)
+    over_units = _units_per_slot(prefs.over_max_block_per_hour)
 
     for task in tasks:
         rem = minutes_to_slots(task.remaining_minutes)
@@ -140,8 +153,11 @@ def build_model(
             continue
 
         min_len = min(minutes_to_slots(task.min_block), rem)
-        max_len = max(min_len, min(minutes_to_slots(task.max_block), rem))
-        ideal = max(min_len, min(minutes_to_slots(task.ideal_block), max_len))
+        # max_block is soft: a block may run longer (up to the day's focus cap) when
+        # that's the only way to get the work done, at a small penalty per extra hour.
+        soft_max = max(min_len, min(minutes_to_slots(task.max_block), rem))
+        max_len = max(soft_max, min(rem, cap))
+        ideal = max(min_len, min(minutes_to_slots(task.ideal_block), soft_max))
         k_max = min(-(-rem // min_len), MAX_CHUNKS_PER_TASK)
 
         tod_windows = {}
@@ -188,8 +204,13 @@ def build_model(
             dev = m.new_int_var(0, max_len, f"dev[{name}]")
             m.add(dev >= length - ideal).only_enforce_if(p)
             m.add(dev >= ideal - length).only_enforce_if(p)
+            over = None
+            if max_len > soft_max:
+                over = m.new_int_var(0, max_len - soft_max, f"over[{name}]")
+                m.add(over >= length - soft_max)  # pinned to min_len when absent, so 0 then
+                objective.append(-over_units * over)
 
-            chunk = _Chunk(task, p, s, length, placed, dev)
+            chunk = _Chunk(task, p, s, length, placed, dev, over=over)
             if tod_windows:
                 t = m.new_bool_var(f"tod[{name}]")
                 m.add_implication(t, p)
@@ -235,9 +256,25 @@ def build_model(
             task_chunks.append(chunk)
 
         # Symmetry breaking: used chunks come first, in time order.
+        # Consecutive blocks need a real break: either SAME_TASK_BREAK_MINUTES of time,
+        # or a (short) event sitting between them.
+        between = [(lo, hi, att) for lo, hi, att in short_events if lo_b < lo and hi < hi_b]
         for a, b in zip(task_chunks, task_chunks[1:]):
             m.add_implication(b.present, a.present)
-            m.add(b.start >= a.start + a.length + buf).only_enforce_if(b.present)
+            if not between:
+                m.add(b.start >= a.start + a.length + break_slots).only_enforce_if(b.present)
+                continue
+            real_break = m.new_bool_var("")
+            m.add(b.start >= a.start + a.length + break_slots).only_enforce_if(real_break)
+            options = [real_break]
+            for lo, hi, att in between:
+                z = m.new_bool_var("")
+                m.add(a.start + a.length + buf <= lo).only_enforce_if(z)
+                m.add(b.start >= hi + buf).only_enforce_if(z)
+                if att is not None:
+                    m.add_implication(z, att)
+                options.append(z)
+            m.add_bool_or(options).only_enforce_if(b.present)
         m.add(sum(c.placed_len for c in task_chunks) <= rem)
         out.chunks.extend(task_chunks)
 
@@ -284,6 +321,8 @@ def solve(
             "block_cost": -prefs.chunk_cost,
             "ideal_deviation": -prefs.ideal_deviation_per_hour * solver.value(c.deviation) / SLOTS_PER_HOUR,
         }
+        if c.over is not None and solver.value(c.over):
+            score["over_max_block"] = -prefs.over_max_block_per_hour * solver.value(c.over) / SLOTS_PER_HOUR
         if c.stay:
             score["stability_bonus"] = prefs.stability_per_hour * sum(solver.value(v) for v in c.stay) / SLOTS_PER_HOUR
         if c.tod_len is not None:

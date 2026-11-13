@@ -26,6 +26,16 @@ def check_invariants(plan: Plan, tasks, events, prefs: Preferences):
             if i != j:
                 assert e1 + buf <= s2 or e2 + buf <= s1, f"overlap or missing buffer: {s1}-{e1} vs {s2}-{e2}"
 
+    by_task: dict = {}
+    for b in plan.blocks:
+        by_task.setdefault(b.task_id, []).append(b)
+    attended = [(e.start, e.end) for e in events if e.id not in skipped]
+    for blocks in by_task.values():
+        for a, b in zip(blocks, blocks[1:]):
+            event_between = any(a.end <= es and ee <= b.start for es, ee in attended)
+            assert event_between or b.start - a.end >= timedelta(minutes=30), \
+                f"{a.title} back-to-back at {a.end:%H:%M} with no event between"
+
     per_day: dict = {}
     for b in plan.blocks:
         assert b.start >= ceil_to_slot(NOW)
@@ -35,7 +45,7 @@ def check_invariants(plan: Plan, tasks, events, prefs: Preferences):
         assert local_e.time() <= prefs.awake_end or local_e.time() == time(0)
         task = by_id.get(b.task_id)
         if task is not None:
-            assert min(task.min_block, task.remaining_minutes) <= b.minutes <= task.max_block
+            assert min(task.min_block, task.remaining_minutes) <= b.minutes  # max_block is soft
             if task.deadline:
                 assert b.end <= task.deadline
             if task.earliest_start:
@@ -104,3 +114,57 @@ def test_slots_count_real_time_across_dst():
     grid = TimeGrid.starting(datetime(2026, 10, 31, 8, tzinfo=TZ), 7)
     assert grid.to_slot_floor(datetime(2026, 11, 1, 8, tzinfo=TZ)) == 25 * 12
     assert grid.to_datetime(25 * 12) == datetime(2026, 11, 1, 8, tzinfo=TZ)
+
+
+def test_deadline_beats_longest_block_limit():
+    """Regression: a task short on time got 55 + 90 min blocks 5 min apart. It should get
+    one longer block instead, since meeting the deadline matters more than max_block."""
+    now = datetime(2026, 11, 12, 13, 20, tzinfo=TZ)
+    deadline = datetime(2026, 11, 12, 16, tzinfo=TZ)
+    tasks = [TaskInput("1", "ORALCOMM Paper", remaining_minutes=180, deadline=deadline)]
+    prefs = Preferences(awake_start=time(9), awake_end=time(23, 55))
+    plan = solve(tasks, [], prefs, now)
+    [block] = plan.blocks
+    assert block.end <= deadline and block.minutes == 160  # all the time there is
+    assert block.score["over_max_block"] < 0
+    assert plan.unmet_minutes["1"] == 20
+
+
+def test_longest_block_still_holds_when_time_is_plentiful():
+    tasks = [TaskInput("t", "Thesis", remaining_minutes=360, deadline=NOW + timedelta(days=3))]
+    plan = solve(tasks, [], Preferences(), NOW)
+    assert sum(b.minutes for b in plan.blocks) == 360
+    assert all(b.minutes <= 120 for b in plan.blocks)
+
+
+SHORT_DAY = Preferences(awake_start=time(8), awake_end=time(11), horizon_days=1)
+
+
+def test_short_event_between_blocks_counts_as_the_break():
+    """A 10-minute event splits the morning; blocks sit right around it (buffers only)."""
+    standup = EventInput("standup", "Standup", at(18, 9, 30), at(18, 9, 40))
+    tasks = [TaskInput("t", "Report", remaining_minutes=165, deadline=at(18, 11))]
+    plan = solve(tasks, [standup], SHORT_DAY, NOW)
+    check_invariants(plan, tasks, [standup], SHORT_DAY)
+    assert [(b.start, b.end) for b in plan.blocks] == [(at(18, 8), at(18, 9, 25)), (at(18, 9, 45), at(18, 11))]
+    assert plan.unmet_minutes["t"] == 5
+
+
+def test_short_event_never_overlapped_even_under_pressure():
+    events = [EventInput(f"e{i}", "Check-in", at(18, 8 + i, 0), at(18, 8 + i, 15)) for i in range(1, 3)]
+    tasks = [TaskInput("t", "Report", remaining_minutes=300, priority=5, deadline=at(18, 11))]
+    plan = solve(tasks, events, SHORT_DAY, NOW)
+    check_invariants(plan, tasks, events, SHORT_DAY)
+    for b in plan.blocks:
+        for e in events:
+            assert b.end + timedelta(minutes=5) <= e.start or e.end + timedelta(minutes=5) <= b.start
+
+
+def test_skipped_short_event_is_not_a_break():
+    """If the short event is skipped, its time is free, so blocks around it merge."""
+    cheap = EventInput("c", "Optional sync", at(18, 9, 30), at(18, 9, 40), skippable=True, skip_cost=0.1)
+    tasks = [TaskInput("t", "Report", remaining_minutes=180, priority=5, deadline=at(18, 11))]
+    plan = solve(tasks, [cheap], SHORT_DAY, NOW)
+    check_invariants(plan, tasks, [cheap], SHORT_DAY)
+    assert [e.attend for e in plan.events] == [False]
+    assert [b.minutes for b in plan.blocks] == [180]

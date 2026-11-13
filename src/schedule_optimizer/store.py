@@ -298,13 +298,18 @@ def save_proposed_plan(s: Session, plan: Plan, now: datetime | None = None) -> l
     return rows
 
 
+LONG_SOLVE_SECONDS = 30.0  # "Re-plan, run longer"
+
+
 def plan_now(
     s: Session, busy_events: list[EventInput], now: datetime, explain: bool = True, source: str = "app",
+    seconds: float | None = None,
 ) -> Plan:
     """Solve from the database and the given calendar events; store the result as proposed.
 
     With `explain`, unmet deadline work is diagnosed (a few extra seconds) and the
-    conflicts are saved with the solve summary.
+    conflicts are saved with the solve summary. `seconds` overrides the solve time limit;
+    a plan that hit the limit has status FEASIBLE (good, not proven best) instead of OPTIMAL.
     """
     prefs = get_prefs(s)
     tasks, weekly = solver_inputs(s, now)
@@ -313,6 +318,8 @@ def plan_now(
     for b in approved_blocks(s, now):
         previous.setdefault(str(b.task_id), []).append((b.start, b.end))
     sp = solver_prefs(prefs)
+    if seconds is not None:
+        sp.solve_seconds = seconds
     plan = solve(tasks, events, sp, now, weekly=weekly, previous=previous)
     if plan.status in ("OPTIMAL", "FEASIBLE"):
         save_proposed_plan(s, plan, now)
@@ -422,7 +429,7 @@ def upcoming_blocks(s: Session, now: datetime) -> list[PlanBlock]:
 
 
 MIN_KEPT_MINUTES = 15  # an under-way block cut shorter than this is dropped, not kept as a sliver
-CONTINUE_WITHIN_MINUTES = 10  # a new block of the same task starting this soon continues the old one
+CONTINUE_WITHIN_MINUTES = 10  # a same-task block starting this soon after the last one continues it
 
 
 def has_unapproved_solve(s: Session) -> bool:
@@ -434,8 +441,8 @@ def approve_plan(s: Session) -> int:
     """Make the latest solve the approved plan. Returns how many blocks were approved.
 
     The solve planned everything from its own start time, so every approved block from
-    then on is replaced. A block that was under way at the solve is handled so nothing
-    odd is left behind:
+    then on is replaced. A block that was under way at the solve, or ended within
+    CONTINUE_WITHIN_MINUTES of it, is handled so nothing odd is left behind:
     - if the new plan continues the same task right away, the two merge into one block;
     - if less than MIN_KEPT_MINUTES of it had passed, it's dropped;
     - otherwise it's cut off at the solve time (what happened before stays).
@@ -448,18 +455,23 @@ def approve_plan(s: Session) -> int:
         return 0
     starts = [b.solved_at for b in proposed] + ([row.solved_at] if row else [])
     cutoff = min(starts)
-    for b in approved_blocks(s, cutoff):  # approved blocks that hadn't ended at the solve
+    window = timedelta(minutes=CONTINUE_WITHIN_MINUTES)
+    # Approved blocks still under way at the solve, or that ended just before it.
+    for b in approved_blocks(s, cutoff - window):
         if b.start >= cutoff:
             s.delete(b)
             continue
+        # The same task picking up right where this block stopped (or would stop now):
+        # one block, which keeps its calendar event.
+        resume_from = min(b.end, cutoff)
         cont = next((p for p in proposed if p.task_id == b.task_id
-                     and p.start - cutoff <= timedelta(minutes=CONTINUE_WITHIN_MINUTES)), None)
-        if cont is not None:  # same task picks up where it was: one block, keeping its calendar event
+                     and timedelta(0) <= p.start - resume_from <= window), None)
+        if cont is not None:
             b.end, b.score = cont.end, cont.score
             proposed.remove(cont)
             s.delete(cont)
             s.add(b)
-        else:
+        elif b.end > cutoff:
             # Cut on the 5-minute grid, so the calendar shows 7:00 rather than 7:04:56.
             cut = cutoff.replace(second=0, microsecond=0) - timedelta(minutes=cutoff.minute % 5)
             if cut - b.start < timedelta(minutes=MIN_KEPT_MINUTES):
@@ -467,6 +479,7 @@ def approve_plan(s: Session) -> int:
             else:
                 b.end = cut
                 s.add(b)
+        # else: it ended before the solve and nothing continues it; it stays as it was.
     for b in proposed:
         b.status = BlockStatus.APPROVED
         s.add(b)

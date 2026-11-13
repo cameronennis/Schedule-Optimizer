@@ -191,11 +191,17 @@ def _busy(s: Session, now: datetime) -> tuple[list, str | None]:
 def solve(s: Session, args: dict, ctx: Ctx) -> dict:
     now = ctx.now()
     events, note = _busy(s, now)
-    plan = store.plan_now(s, events, now, source=ctx.source)
+    seconds = args.get("seconds")
+    seconds = None if seconds is None else max(1.0, min(float(seconds), 60.0))
+    plan = store.plan_now(s, events, now, source=ctx.source, seconds=seconds)
     out = changes.plan_summary(s, plan, now)
     row = store.last_solve(s)
     out["conflicts"] = [conflict_text(c) for c in row.conflicts] if row else []
     out["next_step"] = "This plan is proposed. Approve it in the Schedule Optimizer window to write it to the Optimizer calendar."
+    if not out["optimal"]:
+        out["not_fully_optimized"] = (f"The solver stopped at its time limit ({plan.wall_seconds:.0f} s) with a good "
+                                      f"but not proven-best plan. Call solve with seconds={store.LONG_SOLVE_SECONDS:g} "
+                                      "to search longer.")
     if note:
         out["note"] = note
     return out
@@ -254,8 +260,11 @@ TOOLS: dict[str, dict] = {
     },
     "solve": {
         "description": "Re-plan from now with the current inputs. The result is a proposed plan; the user "
-                       "approves it in the app before anything is written to their calendar.",
-        "input_schema": _EMPTY, "handler": solve, "read_only": False,
+                       "approves it in the app before anything is written to their calendar. If the result "
+                       "isn't optimal, call again with a longer `seconds`.",
+        "input_schema": {"type": "object", "properties": {"seconds": {
+            "type": "number", "description": "Solve time limit, 1–60 (default from preferences, 5)."}}},
+        "handler": solve, "read_only": False,
     },
     "propose_changes": {
         "description": "Propose changes to the planner's inputs (never to blocks directly) and preview the "

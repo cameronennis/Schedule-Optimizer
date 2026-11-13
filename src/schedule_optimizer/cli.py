@@ -163,8 +163,11 @@ def cmd_event(args, s, tz):
 def cmd_plan(args, s, tz):
     now = datetime.now(tz)
     events = [] if args.offline else busy_events(s, now, choose=pick_calendars)
-    plan = store.plan_now(s, events, now)
+    plan = store.plan_now(s, events, now, seconds=args.seconds)
     print_plan(plan)
+    if plan.status == "FEASIBLE":
+        print(f"\nNot fully optimized: the solver stopped at its time limit ({plan.wall_seconds:.0f} s). "
+              f"Run longer with: schedule-optimizer plan --seconds {store.LONG_SOLVE_SECONDS:g}")
     if plan.blocks:
         print("\nThis plan is proposed. Approve it with: schedule-optimizer approve")
 
@@ -297,6 +300,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     plan = sub.add_parser("plan", help="solve and show a proposed plan")
     plan.add_argument("--offline", action="store_true", help="ignore Google Calendar")
+    plan.add_argument("--seconds", type=float, help="solve time limit (default 5)")
     sub.add_parser("approve", help="approve the proposed plan and write it to the Optimizer calendar") \
         .add_argument("--no-sync", action="store_true", help="approve without writing to Google")
     sub.add_parser("sync", help="rewrite approved blocks to the Optimizer calendar")

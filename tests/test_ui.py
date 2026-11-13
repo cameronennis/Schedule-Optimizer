@@ -1,5 +1,6 @@
 """The app window, driven by NiceGUI's simulated user (no real window or browser)."""
 
+import asyncio
 from datetime import datetime, timedelta
 
 import pytest
@@ -209,3 +210,36 @@ async def test_api_mode_chat_tab(app_db, monkeypatch):
         user.find(marker="chat-input").type("I'm tired")
         user.find(marker="chat-send").click()
         await user.should_see("Take a 20-minute walk first.", retries=100)
+
+
+async def test_not_fully_optimized_is_flagged_with_a_longer_option(app_db, monkeypatch):
+    from schedule_optimizer.domain import Plan
+    finish_setup()
+    with db.session() as s:
+        store.save_last_solve(s, Plan("FEASIBLE", 12.0, [], [], {}, 5.0), [], [], "app")
+    calls = []
+
+    async def fake_replan(seconds=None):
+        calls.append(seconds)
+
+    monkeypatch.setattr(ui_app, "replan", fake_replan)
+    async with user_simulation(root=ui_app.root) as user:
+        await user.open("/")
+        await user.should_see("not fully optimized")
+        user.find(marker="optimize-longer").click()
+        for _ in range(50):  # the click handler runs as a background task
+            if calls:
+                break
+            await asyncio.sleep(0.02)
+    assert calls == [store.LONG_SOLVE_SECONDS]
+
+
+async def test_optimal_plan_says_so(app_db):
+    from schedule_optimizer.domain import Plan
+    finish_setup()
+    with db.session() as s:
+        store.save_last_solve(s, Plan("OPTIMAL", 12.0, [], [], {}, 0.4), [], [], "app")
+    async with user_simulation(root=ui_app.root) as user:
+        await user.open("/")
+        await user.should_see("optimal")
+        await user.should_not_see("not fully optimized")

@@ -241,19 +241,19 @@ def _use_google() -> bool:
         return bool(store.get_prefs(s).busy_calendars)
 
 
-def _solve(use_google: bool) -> tuple[Plan, list[EventInput]]:
+def _solve(use_google: bool, seconds: float | None = None) -> tuple[Plan, list[EventInput]]:
     with db.session() as s:
         now = datetime.now(store.local_tz(store.get_prefs(s)))
         events = busy_events(s, now) if use_google else []
         events = store.apply_event_settings(s, events)
-        return store.plan_now(s, events, now), events
+        return store.plan_now(s, events, now, seconds=seconds), events
 
 
-async def replan() -> None:
+async def replan(seconds: float | None = None) -> None:
     STATE["error"] = None
-    n = ui.notification("Planning…", spinner=True, timeout=None)
+    n = ui.notification(f"Planning for up to {seconds:g} s…" if seconds else "Planning…", spinner=True, timeout=None)
     try:
-        plan, events = await run.io_bound(_solve, _use_google())
+        plan, events = await run.io_bound(_solve, _use_google(), seconds)
         STATE.update(plan=plan, events=events, solved_at=datetime.now())
         n.dismiss()
         if plan.status not in ("OPTIMAL", "FEASIBLE"):
@@ -343,7 +343,10 @@ def now_view() -> None:
         holds = store.list_holds(s, now)
 
     with ui.row().classes("items-center gap-2"):
-        ui.button("Re-plan", icon="auto_awesome", on_click=replan).mark("replan")
+        with ui.dropdown_button("Re-plan", icon="auto_awesome", split=True, auto_close=True,
+                                on_click=lambda: replan()).mark("replan"):
+            ui.item(f"Re-plan, run longer ({store.LONG_SOLVE_SECONDS:g} s)",
+                    on_click=lambda: replan(store.LONG_SOLVE_SECONDS)).mark("replan-long")
         ui.button("Approve plan", icon="check", on_click=approve).mark("approve") \
             .props("" if can_approve or holds else "disable") \
             .tooltip("Saves this plan and writes it, with any breaks, to your Optimizer calendar")
@@ -378,8 +381,19 @@ def now_view() -> None:
     if row:
         with ui.row().classes("gap-4 text-sm text-gray-600 items-center"):
             by = {"claude-desktop": " by Claude Desktop", "api": " by Claude"}.get(row.source, "")
-            ui.label(f"{row.status.title()} · {row.objective_points:.1f} points · "
-                     f"solved {row.solved_at.astimezone(zone):%a %H:%M}{by}")
+            ui.label(f"{row.objective_points:.1f} points · solved {row.solved_at.astimezone(zone):%a %H:%M}{by}")
+            if row.status == "OPTIMAL":
+                ui.badge("optimal", color="positive").tooltip("The solver proved no better plan exists")
+            elif row.status == "FEASIBLE":
+                with ui.row().classes("items-center gap-1").mark("not-optimal"):
+                    ui.badge("not fully optimized", color="warning") \
+                        .tooltip(f"The solver stopped at its time limit ({row.wall_seconds:.0f} s) before "
+                                 "proving this is the best plan")
+                    ui.button(f"Keep optimizing ({store.LONG_SOLVE_SECONDS:g} s)",
+                              on_click=lambda: replan(store.LONG_SOLVE_SECONDS)).props("flat dense") \
+                        .mark("optimize-longer")
+            else:
+                ui.badge(row.status.lower(), color="negative")
             for e in row.events:
                 if e["skippable"] and not e["attend"]:
                     ui.label(f"Skips “{e['title']}” ({datetime.fromisoformat(e['start']).astimezone(zone):%a %H:%M}, "

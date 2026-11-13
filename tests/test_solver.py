@@ -168,3 +168,34 @@ def test_skipped_short_event_is_not_a_break():
     check_invariants(plan, tasks, [cheap], SHORT_DAY)
     assert [e.attend for e in plan.events] == [False]
     assert [b.minutes for b in plan.blocks] == [180]
+
+
+# ---- symmetry breaking and solve quality ------------------------------------------------
+
+def test_identical_tasks_are_ordered_not_searched_twice():
+    """Two interchangeable tasks: the first one listed starts first, and the plan is still optimal."""
+    tasks = [TaskInput("a", "Reading A", remaining_minutes=120, deadline=at(19, 23)),
+             TaskInput("b", "Reading B", remaining_minutes=120, deadline=at(19, 23))]
+    prefs = Preferences(horizon_days=2)
+    plan = solve(tasks, [], prefs, NOW)
+    check_invariants(plan, tasks, [], prefs)
+    assert plan.status == "OPTIMAL" and not plan.unmet_minutes
+    first = {t: min(b.start for b in plan.blocks if b.task_id == t) for t in ("a", "b")}
+    assert first["a"] <= first["b"]
+
+
+def test_replan_with_previous_blocks_reaches_optimal():
+    """Regression: the stability bonus used helper variables with many equivalent values,
+    so re-plans hit the 5 s limit without proving the best plan."""
+    tasks, events, prefs, weekly = scenario()
+    prefs.solve_seconds = 15  # proves optimal in ~4 s on a laptop; leave headroom for slow CI
+    first = solve(tasks, events, prefs, NOW, weekly=weekly)
+    previous = {}
+    for b in first.blocks:
+        previous.setdefault(b.task_id.split("@")[0], []).append((b.start, b.end))
+    later = NOW + timedelta(minutes=50)
+    replan = solve(tasks, events, prefs, later, weekly=weekly, previous=previous)
+    assert replan.status == "OPTIMAL"
+    # Blocks that were already in good places stay put.
+    kept = sum(1 for b in replan.blocks if (b.start, b.end) in {s for v in previous.values() for s in v})
+    assert kept >= len(replan.blocks) // 2

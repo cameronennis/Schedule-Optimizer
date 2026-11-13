@@ -45,6 +45,7 @@ A local desktop app that reads Google Calendar, takes tasks with weights, and us
 - NiceGUI is v4. Always pass `host="127.0.0.1"` to `ui.run` (the default in browser mode listens on the whole network). Async `@ui.refreshable` sections must be awaited; from sync code use `ui_app.load_later`. UI tests use `nicegui.testing.user_simulation(root=...)` with pytest-asyncio.
 - The desktop app's preview runner (`preview_start`) hangs on this project; to eyeball the UI, run a script with `.venv/bin/python` in the background and open http://127.0.0.1:8765 in the built-in browser.
 - MCP Python SDK is v2: `FastMCP` was renamed `MCPServer`. The helper uses the low-level `mcp.server.lowlevel.Server` with `on_list_tools`/`on_call_tool`, because tool schemas are shared JSON specs in `claude_tools.py`. Types come from `mcp_types` (snake_case fields such as `input_schema`, `is_error`).
+- Solver speed: avoid helper variables that can take many values for one plan (they make CP-SAT time out without proving optimality). The re-plan stability overlap uses four linear upper bounds plus a per-span total and a time-order rule; with these, re-plans prove optimal in about 1 s on real data.
 - Tests set `SCHEDULE_OPTIMIZER_OFFLINE=1` so nothing touches the real Google account or keychain token.
 - Don't build a custom "Sign in with Claude." Anthropic doesn't allow third-party apps to collect Claude.ai credentials or route requests through subscriptions. API-key mode uses a key from the Claude Console stored in keyring.
 

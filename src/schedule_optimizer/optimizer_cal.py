@@ -23,6 +23,7 @@ from .tables import Hold, PlanBlock
 CALENDAR_NAME = "Optimizer"
 APP_TAG = "schedule-optimizer"
 BATCH_SIZE = 50
+LOOKBACK = timedelta(days=1)  # how far back the calendar is compared with the database
 
 
 @dataclass
@@ -104,7 +105,8 @@ def _run_batches(service, requests: list) -> list[tuple[object, dict | None, Exc
 def sync_approved(service, s: Session, now: datetime | None = None) -> SyncResult:
     """Make the Optimizer calendar mirror the approved blocks and holds from `now` on.
 
-    Calendar events that end after `now` are compared with the database:
+    Calendar events that ended within LOOKBACK, or later, are compared with the database
+    (looking back lets a block merged at a re-plan update its earlier event):
     - same key (task and times): kept;
     - the event of a block whose times changed (cut off or merged at a re-plan): patched to match;
     - anything else: deleted.
@@ -112,16 +114,16 @@ def sync_approved(service, s: Session, now: datetime | None = None) -> SyncResul
     """
     now = now or datetime.now(timezone.utc)
     cal_id = ensure_calendar(service, s)
-    # Include blocks that just ended: one cut off at the re-plan may still have a longer event.
-    blocks = store.approved_blocks(s, now - timedelta(days=1))
+    since = now - LOOKBACK
+    blocks = store.approved_blocks(s, since)
     titles = {t.id: t.title for t in store.list_tasks(s, include_done=True)}
     wanted: dict[str, PlanBlock | Hold] = {block_key(b.task_id, b.start, b.end): b for b in blocks}
-    wanted |= {hold_key(h): h for h in store.list_holds(s, now)}
+    wanted |= {hold_key(h): h for h in store.list_holds(s, since)}
     by_event_id = {b.google_event_id: k for k, b in wanted.items()
                    if isinstance(b, PlanBlock) and b.google_event_id}
 
     existing = list(_paged(
-        service.events().list, calendarId=cal_id, timeMin=_rfc3339(now), singleEvents=True,
+        service.events().list, calendarId=cal_id, timeMin=_rfc3339(since), singleEvents=True,
         privateExtendedProperty=f"app={APP_TAG}", maxResults=2500,
     ))
     result = SyncResult()

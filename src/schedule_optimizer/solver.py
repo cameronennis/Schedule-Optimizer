@@ -63,6 +63,7 @@ class _Chunk:
     tod_len: cp_model.IntVar | None = None
     over: cp_model.IntVar | None = None  # slots beyond the soft max_block
     stay: list = field(default_factory=list)  # overlap with previously approved blocks
+    overlaps: list = field(default_factory=list)  # one flag per previous span: overlaps it at all
 
 
 @dataclass
@@ -184,6 +185,7 @@ def build_model(
         objective.append(cost * attend - cost)  # lose skip_cost points if not attended
 
     day_loads: dict = {d: [] for d in windows}
+    twins: dict[tuple, list[list[_Chunk]]] = {}
     f_units = round(prefs.chunk_cost * SCALE)
     a_units = _units_per_slot(prefs.ideal_deviation_per_hour)
     b_units = _units_per_slot(prefs.time_of_day_bonus_per_hour)
@@ -238,6 +240,7 @@ def build_model(
             plo, phi = max(grid.clamp(grid.to_slot_floor(ps)), lo_b), min(grid.clamp(grid.to_slot_ceil(pe)), hi_b)
             if plo < phi:
                 prev_spans.append((plo, phi))
+        prev_spans.sort()  # the ordering rule below relies on time order
         task_chunks: list[_Chunk] = []
         for k in range(k_max):
             name = f"{task.id}#{k}"
@@ -283,10 +286,12 @@ def build_model(
             dev = m.new_int_var(0, max_len, f"dev[{name}]")
             m.add(dev >= length - ideal).only_enforce_if(p)
             m.add(dev >= ideal - length).only_enforce_if(p)
+            m.add(dev == 0).only_enforce_if(~p)  # unused chunks: one value for every helper
             over = None
             if max_len > soft_max:
                 over = m.new_int_var(0, max_len - soft_max, f"over[{name}]")
-                m.add(over >= length - soft_max)  # pinned to min_len when absent, so 0 then
+                m.add(over >= length - soft_max)
+                m.add(over == 0).only_enforce_if(~p)
                 objective.append(-over_units * over)
 
             chunk = _Chunk(task, p, s, length, placed, dev, over=over)
@@ -313,26 +318,34 @@ def build_model(
                 objective.append(-EARLINESS_UNITS_PER_SLOT * s)
 
             # Stability: reward overlap with this task's previously approved blocks.
-            # overlap = max(0, min(ends) − max(starts)); lo/hi are bounds the solver
-            # pushes tight because it's maximizing, and `gap` may be negative.
+            # overlap = min(ends) − max(starts), which is the smallest of the four
+            # end − start pairings. The solver maximizes `ov`, so upper bounds are enough.
+            # `o` says the chunk overlaps this span at all (the bounds go negative otherwise);
+            # it's implied by the times, so it adds no equivalent copies of one plan.
             for plo, phi in prev_spans:
-                n = grid.num_slots
-                lo = m.new_int_var(0, n, "")
-                hi = m.new_int_var(0, n, "")
-                m.add(lo >= s)
-                m.add(lo >= plo)
-                m.add(hi <= s + length)
-                m.add(hi <= phi)
-                gap = m.new_int_var(-n, n, "")
-                m.add(gap == hi - lo)
-                pos = m.new_int_var(0, n, "")
-                m.add_max_equality(pos, [gap, 0])
+                o = m.new_bool_var(f"overlaps[{name}]")
+                m.add_implication(o, p)
                 ov = m.new_int_var(0, min(max_len, phi - plo), f"stay[{name}]")
-                m.add(ov <= pos)
-                m.add(ov <= max_len * p)
+                m.add(ov <= length)
+                m.add(ov <= s + length - plo).only_enforce_if(o)
+                m.add(ov <= phi - s).only_enforce_if(o)
+                m.add(ov <= max_len * o)
                 objective.append(stay_units * ov)
                 chunk.stay.append(ov)
+                chunk.overlaps.append(o)
             task_chunks.append(chunk)
+
+        if prev_spans and task_chunks:
+            # Chunks don't overlap each other, so together they keep at most a span's length.
+            # This bound is what lets CP-SAT prove a re-plan optimal instead of timing out.
+            for j, (plo, phi) in enumerate(prev_spans):
+                m.add(sum(c.stay[j] for c in task_chunks) <= phi - plo)
+            # Chunks and spans are both in time order, so a later chunk can't overlap an
+            # earlier span than the chunk before it did.
+            for a, b in zip(task_chunks, task_chunks[1:]):
+                for j in range(len(prev_spans)):
+                    for jj in range(j + 1, len(prev_spans)):
+                        m.add_bool_or([~b.overlaps[j], ~a.overlaps[jj]])
 
         # Symmetry breaking: used chunks come first, in time order.
         # Consecutive blocks need a real break: either SAME_TASK_BREAK_MINUTES of time,
@@ -353,7 +366,13 @@ def build_model(
                 if att is not None:
                     m.add_implication(z, att)
                 options.append(z)
-            m.add_bool_or(options).only_enforce_if(b.present)
+            # Exactly one reason per gap (not "at least one"), so one plan has one encoding.
+            m.add(sum(options) == 1).only_enforce_if(b.present)
+            m.add(sum(options) == 0).only_enforce_if(~b.present)
+        if task_chunks and not prev_spans and diag is None:
+            sig = (rem, task.priority, task.deadline, task.earliest_start, task.min_block,
+                   task.ideal_block, task.max_block, task.time_of_day)
+            twins.setdefault(sig, []).append(task_chunks)
         placed_total = sum(c.placed_len for c in task_chunks)
         m.add(placed_total <= rem)
         if required:
@@ -364,6 +383,15 @@ def build_model(
             # bound, which CP-SAT proves faster than plain feasibility.
             m.maximize(placed_total)
         out.chunks.extend(task_chunks)
+
+    # Identical tasks (same work left, value, window and block sizes) are interchangeable:
+    # swapping them gives the same plan with the titles swapped. Order them by when their
+    # first block starts, so the solver doesn't explore both labelings.
+    for group in twins.values():
+        for a_chunks, b_chunks in zip(group, group[1:]):
+            a0, b0 = a_chunks[0], b_chunks[0]
+            m.add_implication(b0.present, a0.present)
+            m.add(a0.start <= b0.start).only_enforce_if(b0.present)
 
     for d, loads in day_loads.items():
         if loads:

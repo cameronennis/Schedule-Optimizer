@@ -445,3 +445,39 @@ def test_short_sliver_of_a_replaced_block_is_dropped(s):
     assert all(datetime.fromisoformat(e["end"]["dateTime"]) - datetime.fromisoformat(e["start"]["dateTime"])
                >= timedelta(minutes=30) for e in events)
     assert old.start not in [b.start for b in store.approved_blocks(s, NOW)]
+
+
+def test_block_that_just_ended_merges_with_the_same_task_continuing(s):
+    """Regression: a Catchup block ended at 20:20, you re-planned at 20:23 with 15 min left,
+    and the plan added a separate 20:25–20:40 slice instead of extending the block."""
+    fake = FakeCalendar()
+    t = store.add_task(s, title="Catchup", total_minutes=60, priority=5, deadline=at(18, 12))
+    store.plan_now(s, [], NOW)
+    optimizer_cal.approve_and_sync(s, fake, NOW)
+    [old] = store.approved_blocks(s, NOW)
+    old_start, old_end = old.start, old.end  # the row itself gets extended below
+    store.log_progress(s, t.id, 45, old_start)
+    after = old_end + timedelta(minutes=3)  # re-plan 3 minutes after the block ended
+    store.plan_now(s, [], after)
+    optimizer_cal.approve_and_sync(s, fake, after)
+    cal_id = store.get_prefs(s).optimizer_calendar_id
+    events = [e for e in fake.optimizer_events(cal_id) if e["summary"] == "Catchup"]
+    assert len(events) == 1  # one block on the calendar, not a block plus a slice
+    [ev] = events
+    assert datetime.fromisoformat(ev["start"]["dateTime"]) == old_start
+    assert datetime.fromisoformat(ev["end"]["dateTime"]) == old_end + timedelta(minutes=20)  # +5 gap, +15 left
+    assert [b.start for b in store.approved_blocks(s, after)] == [old_start]
+
+
+def test_block_that_ended_long_ago_is_left_alone(s):
+    fake = FakeCalendar()
+    t = store.add_task(s, title="Catchup", total_minutes=120, priority=5, deadline=at(19, 12))
+    store.plan_now(s, [], NOW)
+    optimizer_cal.approve_and_sync(s, fake, NOW)
+    first = store.approved_blocks(s, NOW)[0]
+    later = first.end + timedelta(minutes=45)
+    store.log_progress(s, t.id, int((first.end - first.start).total_seconds() // 60), first.start)
+    store.plan_now(s, [], later)
+    optimizer_cal.approve_and_sync(s, fake, later)
+    blocks = store.approved_blocks(s, first.start - timedelta(minutes=1))
+    assert (first.start, first.end) in [(b.start, b.end) for b in blocks]  # unchanged

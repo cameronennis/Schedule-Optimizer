@@ -227,6 +227,7 @@ def plan_summary(s: Session, plan: Plan, now: datetime, max_blocks: int = 40) ->
 
     return {
         "status": plan.status,
+        "optimal": plan.status == "OPTIMAL",
         "unmet": {title(k): v for k, v in plan.unmet_minutes.items()},
         "skipped_events": [f"{e.title} ({e.start.astimezone(tz):%a %H:%M}, cost {e.skip_cost:g})"
                            for e in plan.skipped],

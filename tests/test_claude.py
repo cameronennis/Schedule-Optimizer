@@ -242,3 +242,9 @@ def test_api_chat_stops_at_the_monthly_cap(s):
     with pytest.raises(claude_api.CapReached):
         claude_api.send(claude_api.Chat(), "hi", lambda: Session(eng), lambda: NOW, client=client)
     assert client.requests == []
+
+
+def test_solve_tool_reports_optimality_and_accepts_a_longer_limit(s):
+    store.add_task(s, title="Essay", total_minutes=60)
+    out = claude_tools.run_tool(s, "solve", {"seconds": 10}, CTX)
+    assert out["optimal"] is True and "not_fully_optimized" not in out

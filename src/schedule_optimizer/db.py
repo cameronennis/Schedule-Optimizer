@@ -30,7 +30,22 @@ def _v1_to_v2(conn) -> None:
     conn.execute(text("ALTER TABLE preferences ADD COLUMN optimizer_calendar_id VARCHAR"))
 
 
-MIGRATIONS: list[Callable] = [_v1_to_v2]
+def _v2_to_v3(conn) -> None:
+    """Phase 7: Claude proposals, app-only holds, the last solve's summary, API spending."""
+    conn.execute(text("ALTER TABLE preferences ADD COLUMN claude_monthly_cap_usd FLOAT NOT NULL DEFAULT 5.0"))
+    for table in (tables.Proposal, tables.Hold, tables.LastSolve, tables.ApiUsage):
+        table.__table__.create(conn)
+
+
+def _v3_to_v4(conn) -> None:
+    """Remember whether the last solve was approved, so an empty re-plan can still be approved."""
+    # A v2 file upgraded in one go already got the column from v3's create(), which uses today's table.
+    columns = {r[1] for r in conn.execute(text("PRAGMA table_info(lastsolve)"))}
+    if "approved_at" not in columns:
+        conn.execute(text("ALTER TABLE lastsolve ADD COLUMN approved_at DATETIME"))
+
+
+MIGRATIONS: list[Callable] = [_v1_to_v2, _v2_to_v3, _v3_to_v4]
 SCHEMA_VERSION = 1 + len(MIGRATIONS)
 
 

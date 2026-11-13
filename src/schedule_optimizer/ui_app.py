@@ -9,18 +9,23 @@ the window stays responsive.
 
 from __future__ import annotations
 
+import json
+import shutil
 from datetime import datetime, time, timedelta
+from pathlib import Path
 
 from nicegui import run, ui
 
-from . import db, google_auth, optimizer_cal, store
-from .calendar_sync import CalendarsNotChosen, busy_events, connect
+from . import changes, claude_api, claude_tools, db, google_auth, optimizer_cal, store
+from .calendar_sync import CalendarsNotChosen, busy_events, busy_events_if_connected, connect
 from .domain import EventInput, Plan, TimeOfDay
 from .gcal import list_calendars
 from .tables import ClaudeMode, EffortMode, Task, TaskStatus
 
-# Single-user desktop app: one shared in-memory cache of the last solve.
+# Single-user desktop app: small in-memory UI state. The plan itself lives in the database
+# (PlanBlock and LastSolve), so solves from the Claude Desktop helper show up here too.
 STATE: dict = {"plan": None, "events": [], "error": None, "solved_at": None}
+CHAT = claude_api.Chat()  # API-key mode conversation, kept until "New chat"
 
 PRIORITY_LABELS = {1: "1 · low", 2: "2", 3: "3 · normal", 4: "4", 5: "5 · top"}
 WHEN_LABELS = {t.value: t.value.capitalize() for t in TimeOfDay}
@@ -280,7 +285,10 @@ async def approve() -> None:
         now_view.refresh()
         return
     n.dismiss()
-    if not count:
+    if not count and result:
+        ui.notify(f"Optimizer calendar updated: {result.inserted} added, {result.deleted} removed, "
+                  f"{result.kept} unchanged.", type="positive")
+    elif not count:
         ui.notify("Nothing to approve.")
     elif result:
         ui.notify(f"Approved {count} blocks. Optimizer calendar: {result.inserted} added, "
@@ -330,12 +338,15 @@ def now_view() -> None:
     with db.session() as s:
         blocks = store.upcoming_blocks(s, now)
         has_proposed = bool(store.proposed_blocks(s))
+        can_approve = has_proposed or store.has_unapproved_solve(s)
         titles = {t.id: t.title for t in store.list_tasks(s, include_done=True)}
+        holds = store.list_holds(s, now)
 
     with ui.row().classes("items-center gap-2"):
         ui.button("Re-plan", icon="auto_awesome", on_click=replan).mark("replan")
         ui.button("Approve plan", icon="check", on_click=approve).mark("approve") \
-            .props("" if has_proposed else "disable").tooltip("Saves this plan and writes it to your Optimizer calendar")
+            .props("" if can_approve or holds else "disable") \
+            .tooltip("Saves this plan and writes it, with any breaks, to your Optimizer calendar")
         ui.button("Log progress", icon="timer", on_click=lambda: open_log_dialog()).props("outline").mark("log")
         ui.label("Using Google Calendar" if _use_google() else "Offline: Google Calendar not used") \
             .classes("text-sm text-gray-500 ml-2")
@@ -357,25 +368,42 @@ def now_view() -> None:
         else:
             ui.label("Nothing planned yet. Add tasks, then press Re-plan.").classes("text-gray-500")
 
-    plan: Plan | None = STATE["plan"]
-    if plan:
-        with ui.row().classes("gap-4 text-sm text-gray-600"):
-            ui.label(f"{plan.status.title()} · {plan.objective_points:.1f} points · {plan.wall_seconds:.1f} s")
-            for e in plan.skipped:
-                ui.label(f"Skips “{e.title}” ({e.start.astimezone(zone):%a %H:%M}, cost {e.skip_cost:g})") \
-                    .classes("text-warning")
-            for task_id, mins in plan.unmet_minutes.items():
-                ui.label(f"Unmet: {titles.get(int(task_id.split('@')[0]), task_id)} · {fmt_minutes(mins)}") \
-                    .classes("text-negative")
+    row = None
+    with db.session() as s:
+        row = store.last_solve(s)
+        pending = changes.pending(s)
+    for p in pending:
+        proposal_card(p)
 
+    if row:
+        with ui.row().classes("gap-4 text-sm text-gray-600 items-center"):
+            by = {"claude-desktop": " by Claude Desktop", "api": " by Claude"}.get(row.source, "")
+            ui.label(f"{row.status.title()} · {row.objective_points:.1f} points · "
+                     f"solved {row.solved_at.astimezone(zone):%a %H:%M}{by}")
+            for e in row.events:
+                if e["skippable"] and not e["attend"]:
+                    ui.label(f"Skips “{e['title']}” ({datetime.fromisoformat(e['start']).astimezone(zone):%a %H:%M}, "
+                             f"cost {e['skip_cost']:g})").classes("text-warning")
+        conflicts = {c["task_id"]: c for c in row.conflicts}
+        for task_id, mins in row.unmet.items():
+            name = titles.get(int(task_id.split("@")[0]), task_id)
+            with ui.row().classes("items-center gap-2"):
+                ui.label(f"Unmet: {name} · {fmt_minutes(mins)}").classes("text-negative text-sm")
+                if task_id in conflicts:
+                    with ui.expansion("Why?").props("dense").classes("text-sm").mark(f"why-{task_id}"):
+                        ui.label(claude_tools.conflict_text(conflicts[task_id])).classes("text-sm max-w-2xl")
+
+    # Holds come from the database, so a new break shows up before the next solve.
+    events = [e for e in store.solve_events(row) if e.end > now and not e.id.startswith("hold:")]
+    events += [EventInput(f"hold:{h.id}", h.title, h.start, h.end) for h in holds]
     items = [("block", b.start, b.end, b) for b in blocks]
-    items += [("event", e.start, e.end, e) for e in STATE["events"] if e.end > now]
+    items += [("event", e.start, e.end, e) for e in events]
     items.sort(key=lambda x: x[1])
-    status = "Proposed plan" if has_proposed else ("Approved plan" if blocks else "")
+    status = "Proposed plan" if has_proposed else ("Approved plan" if blocks else ("Holds" if holds else ""))
     if status:
         ui.label(status).classes("text-lg font-medium mt-2")
     day = None
-    skipped = {e.event_id for e in plan.skipped} if plan else set()
+    skipped = {e["id"] for e in (row.events if row else []) if e["skippable"] and not e["attend"]}
     for kind, start, end, obj in items:
         s_local, e_local = start.astimezone(zone), end.astimezone(zone)
         if s_local.date() != day:
@@ -388,12 +416,153 @@ def now_view() -> None:
                 ui.label(titles.get(obj.task_id, "?")).classes("font-medium")
                 pts = sum(obj.score.values()) if obj.score else 0
                 ui.label(f"{(end - start).seconds // 60} min · {pts:+.1f} pts").classes("text-sm text-gray-500")
+            elif obj.id.startswith("hold:"):
+                ui.icon("coffee", color="grey")
+                ui.label(obj.title).classes("text-gray-600")
+                ui.badge("hold", color="grey")
+                ui.button(icon="close", on_click=lambda hid=int(obj.id[5:]): remove_hold(hid)) \
+                    .props("flat round dense").tooltip("Remove this hold")
             else:
                 ui.icon("event_busy" if obj.id in skipped else "event", color="grey")
                 ui.label(obj.title).classes("text-gray-500" + (" line-through" if obj.id in skipped else ""))
                 if obj.skippable:
                     ui.badge("skipped" if obj.id in skipped else f"skippable · {obj.skip_cost:g}",
                              color="orange" if obj.id in skipped else "grey")
+
+
+def remove_hold(hold_id: int) -> None:
+    with db.session() as s:
+        try:
+            store.delete_hold(s, hold_id)
+        except KeyError:
+            pass
+    ui.notify("Hold removed. Re-plan to use the time, then Approve plan to update your calendar.")
+    now_view.refresh()
+
+
+# ---- Claude proposals ------------------------------------------------------------------
+
+
+def _minutes_text(unmet: dict) -> str:
+    return ", ".join(f"{k} {fmt_minutes(v)}" for k, v in unmet.items()) or "none"
+
+
+def proposal_card(p) -> None:
+    prev = p.preview or {}
+    with ui.card().classes("w-full border-l-4 border-primary").mark(f"proposal-{p.id}"):
+        ui.label("Claude suggests").classes("text-sm text-gray-500")
+        ui.label(p.summary).classes("font-medium")
+        for d in prev.get("changes", []):
+            ui.label(f"• {d}").classes("text-sm")
+        before, after = prev.get("before", {}), prev.get("after", {})
+        if before.get("unmet") != after.get("unmet"):
+            ui.label(f"Unmet: {_minutes_text(before.get('unmet', {}))} → {_minutes_text(after.get('unmet', {}))}") \
+                .classes("text-sm text-gray-600")
+        if before.get("skipped_events") != after.get("skipped_events"):
+            ui.label(f"Skipped events: {', '.join(before.get('skipped_events', [])) or 'none'} → "
+                     f"{', '.join(after.get('skipped_events', [])) or 'none'}").classes("text-sm text-gray-600")
+        if prev.get("blocks_changed"):
+            ui.label(f"{prev['blocks_changed']} blocks move").classes("text-sm text-gray-600")
+        with ui.row():
+            ui.button("Apply", icon="check", on_click=lambda pid=p.id: apply_proposal(pid)).mark(f"apply-{p.id}")
+            ui.button("Dismiss", on_click=lambda pid=p.id: dismiss_proposal(pid)).props("flat") \
+                .mark(f"dismiss-{p.id}")
+
+
+def _apply(proposal_id: int):
+    with db.session() as s:
+        now = datetime.now(store.local_tz(store.get_prefs(s)))
+        events, _note = busy_events_if_connected(s, now)
+        return changes.apply_proposal(s, proposal_id, events, now)
+
+
+async def apply_proposal(proposal_id: int) -> None:
+    n = ui.notification("Applying and re-planning…", spinner=True, timeout=None)
+    try:
+        done, plan = await run.io_bound(_apply, proposal_id)
+    except Exception as e:  # noqa: BLE001
+        n.dismiss()
+        notify_error(e)
+        return
+    n.dismiss()
+    ui.notify("Applied. Review the new plan, then Approve plan.", type="positive")
+    refresh_all()
+
+
+def dismiss_proposal(proposal_id: int) -> None:
+    with db.session() as s:
+        try:
+            changes.dismiss_proposal(s, proposal_id)
+        except (KeyError, ValueError) as e:
+            notify_error(e)
+    refresh_all()
+
+
+def refresh_all() -> None:
+    now_view.refresh()
+    tasks_view.refresh()
+    chat_view.refresh()
+
+
+# ---- Claude chat (API-key mode) ----------------------------------------------------------
+
+
+def _send_chat(text: str) -> None:
+    def now_fn():
+        with db.session() as s:
+            return datetime.now(store.local_tz(store.get_prefs(s)))
+
+    claude_api.send(CHAT, text, db.session, now_fn)
+
+
+@ui.refreshable
+def chat_view() -> None:
+    if not claude_api.has_key():
+        ui.label("Add your Claude API key in Preferences to chat here.").classes("text-gray-500")
+        return
+    with ui.column().classes("w-full gap-2"):
+        for role, text in CHAT.log:
+            if role == "user":
+                ui.chat_message(text, name="You", sent=True)
+            elif role == "claude":
+                with ui.chat_message(name="Claude"):
+                    ui.markdown(text)
+            elif role == "tool":
+                ui.label(text).classes("text-xs text-gray-500 pl-12")
+            else:
+                ui.label(text).classes("text-negative text-sm")
+        with db.session() as s:
+            mine = [p for p in changes.pending(s) if p.id in CHAT.proposals]
+        for p in mine:
+            proposal_card(p)
+    with ui.row().classes("w-full items-end no-wrap"):
+        box = ui.textarea(placeholder="e.g. “I'm exhausted, lighten my afternoon”").props("autogrow") \
+            .classes("grow").mark("chat-input")
+
+        async def send() -> None:
+            text = (box.value or "").strip()
+            if not text:
+                return
+            box.value = ""
+            n = ui.notification("Claude is thinking…", spinner=True, timeout=None)
+            try:
+                await run.io_bound(_send_chat, text)
+            except (claude_api.CapReached, claude_api.NoKey) as e:
+                CHAT.log.append(("error", str(e)))
+            except Exception as e:  # noqa: BLE001 (network, bad key, …)
+                CHAT.log.append(("error", f"Couldn't reach Claude: {e}"))
+            n.dismiss()
+            refresh_all()
+
+        ui.button(icon="send", on_click=send).props("round").mark("chat-send")
+
+    def new_chat() -> None:
+        CHAT.messages.clear()
+        CHAT.log.clear()
+        CHAT.proposals.clear()
+        chat_view.refresh()
+
+    ui.button("New chat", icon="refresh", on_click=new_chat).props("flat dense")
 
 
 # ---- Tasks -----------------------------------------------------------------------------
@@ -673,12 +842,89 @@ def prefs_view() -> None:
     calendar_picker()
     ui.separator().classes("my-4")
     ui.label("Claude").classes("text-lg font-medium")
+    claude_prefs()
+
+
+def desktop_config() -> dict:
+    """The Claude Desktop config entry for running the helper from this checkout (development)."""
+    project = Path(__file__).resolve().parents[2]
+    uv = shutil.which("uv") or "uv"
+    return {"mcpServers": {"schedule-optimizer": {
+        "command": uv, "args": ["run", "--directory", str(project), "schedule-optimizer-mcp"]}}}
+
+
+def claude_prefs() -> None:
     with db.session() as s:
-        mode = store.get_prefs(s).claude_mode
+        prefs = store.get_prefs(s)
+        spent = claude_api.month_usage(s).cost_usd
+
+    def set_mode(e) -> None:
+        with db.session() as s:
+            store.update_prefs(s, claude_mode=ClaudeMode(e.value))
+        root_view.refresh()
+
+    ui.label("Claude never places blocks. It suggests changes to tasks, events and preferences; "
+             "you apply them, and the solver re-plans.").classes("text-sm text-gray-500")
     ui.select({ClaudeMode.OFF.value: "Off (works offline)",
-               ClaudeMode.DESKTOP.value: "Claude Desktop (coming in Phase 7)",
-               ClaudeMode.API_KEY.value: "API key (coming in Phase 7)"},
-              label="Claude mode", value=mode.value).classes("w-80").props("disable")
+               ClaudeMode.DESKTOP.value: "Claude Desktop (uses your Claude plan)",
+               ClaudeMode.API_KEY.value: "API key (chat in this window, billed per use)"},
+              label="Claude mode", value=prefs.claude_mode.value, on_change=set_mode).classes("w-96") \
+        .mark("claude-mode")
+
+    if prefs.claude_mode == ClaudeMode.DESKTOP:
+        ui.label("Add this to Claude Desktop's config (Settings › Developer › Edit Config), "
+                 "then fully quit and reopen Claude Desktop.").classes("text-sm mt-2")
+        snippet = json.dumps(desktop_config(), indent=2)
+        ui.code(snippet, language="json").classes("w-full")
+        ui.label("If the file already has an \"mcpServers\" section, add just the \"schedule-optimizer\" entry "
+                 "inside it.").classes("text-sm text-gray-500")
+
+    if prefs.claude_mode == ClaudeMode.API_KEY:
+        if claude_api.has_key():
+            with ui.row().classes("items-center gap-3 mt-2"):
+                ui.label("API key saved in your system keychain.").classes("text-sm")
+
+                def forget() -> None:
+                    claude_api.forget_key()
+                    ui.notify("Key removed.")
+                    root_view.refresh()
+
+                ui.button("Remove key", icon="key_off", on_click=forget).props("outline dense")
+        else:
+            ui.label("Create a key in the Claude Console (platform.claude.com), then paste it here. "
+                     "It's stored in your system keychain, not in the app's files.").classes("text-sm mt-2")
+            with ui.row().classes("items-end gap-2"):
+                key = ui.input("API key", password=True, password_toggle_button=True).classes("w-96") \
+                    .mark("api-key")
+
+                async def save_key() -> None:
+                    n = ui.notification("Checking the key…", spinner=True, timeout=None)
+                    try:
+                        await run.io_bound(claude_api.save_key, key.value or "")
+                    except Exception as e:  # noqa: BLE001
+                        n.dismiss()
+                        notify_error(ValueError(f"That key didn't work: {e}"))
+                        return
+                    n.dismiss()
+                    ui.notify("Key saved.", type="positive")
+                    root_view.refresh()
+
+                ui.button("Save key", icon="key", on_click=save_key).mark("api-key-save")
+        with ui.row().classes("items-end gap-3"):
+            cap = ui.number("Monthly spending cap", value=prefs.claude_monthly_cap_usd, min=0, step=1,
+                            prefix="$").classes("w-44").mark("api-cap")
+
+            def save_cap() -> None:
+                try:
+                    with db.session() as s:
+                        store.update_prefs(s, claude_monthly_cap_usd=float(cap.value or 0))
+                except ValueError as e:
+                    notify_error(e)
+                    return
+                ui.notify("Cap saved.", type="positive")
+
+            ui.button("Save cap", on_click=save_cap).props("flat")
+            ui.label(f"Spent this month: about ${spent:.2f}").classes("text-sm text-gray-500")
 
 
 # ---- First-run setup -------------------------------------------------------------------
@@ -719,18 +965,23 @@ def setup_view() -> None:
 def root_view() -> None:
     with db.session() as s:
         store.import_legacy_settings(s)
-        done = store.get_prefs(s).setup_complete
+        prefs = store.get_prefs(s)
+        done, mode = prefs.setup_complete, prefs.claude_mode
     if not done:
         setup_view()
         return
     with ui.tabs().classes("w-full") as tabs:
         now_tab = ui.tab("Now", icon="today")
+        chat_tab = ui.tab("Claude", icon="chat") if mode == ClaudeMode.API_KEY else None
         tasks_tab = ui.tab("Tasks", icon="checklist")
         events_tab = ui.tab("Events", icon="event")
         prefs_tab = ui.tab("Preferences", icon="tune")
     with ui.tab_panels(tabs, value=now_tab).classes("w-full"):
         with ui.tab_panel(now_tab):
             now_view()
+        if chat_tab is not None:
+            with ui.tab_panel(chat_tab):
+                chat_view()
         with ui.tab_panel(tasks_tab):
             tasks_view()
         with ui.tab_panel(events_tab):
@@ -749,3 +1000,26 @@ def root() -> None:
         ui.label("Schedule Optimizer").classes("text-lg font-medium")
     with ui.column().classes("w-full max-w-5xl mx-auto p-4"):
         root_view()
+    watch_for_outside_changes()
+
+
+def _stamp() -> tuple:
+    """Changes worth redrawing for: a new solve, proposals, tasks, holds."""
+    with db.session() as s:
+        row = store.last_solve(s)
+        return (row.solved_at if row else None, tuple(p.id for p in changes.pending(s)),
+                len(store.list_tasks(s, include_done=True)), len(store.list_holds(s)))
+
+
+def watch_for_outside_changes() -> None:
+    """The Claude Desktop helper writes to the same database; redraw when it does."""
+    last = {"stamp": _stamp()}
+
+    def check() -> None:
+        stamp = _stamp()
+        if stamp != last["stamp"]:
+            last["stamp"] = stamp
+            now_view.refresh()
+            tasks_view.refresh()
+
+    ui.timer(3.0, check)

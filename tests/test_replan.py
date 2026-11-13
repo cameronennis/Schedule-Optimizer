@@ -198,13 +198,16 @@ def test_stability_never_overrides_real_value():
 
 # ---- schema migration ----------------------------------------------------------------
 
-def test_phase4_database_upgrades_to_v2(tmp_path):
+def test_phase4_database_upgrades_to_latest(tmp_path):
     path = tmp_path / "old.db"
     eng = create_engine(f"sqlite:///{path}")
     SQLModel.metadata.create_all(eng)
     with eng.begin() as conn:  # make it look like a Phase 4 (v1) file
         conn.execute(text("ALTER TABLE preferences DROP COLUMN stability_per_hour"))
         conn.execute(text("ALTER TABLE preferences DROP COLUMN optimizer_calendar_id"))
+        conn.execute(text("ALTER TABLE preferences DROP COLUMN claude_monthly_cap_usd"))  # v3 additions
+        for table in ("proposal", "hold", "lastsolve", "apiusage"):
+            conn.execute(text(f"DROP TABLE {table}"))
         conn.execute(text("INSERT INTO preferences (id, awake_start, awake_end, max_focus_minutes_per_day, "
                           "buffer_minutes, horizon_days, busy_calendars, claude_mode, setup_complete, chunk_cost, "
                           "ideal_deviation_per_hour, time_of_day_bonus_per_hour) VALUES (1, '08:00:00', '23:00:00', "
@@ -217,8 +220,9 @@ def test_phase4_database_upgrades_to_v2(tmp_path):
         p = store.get_prefs(session)
         assert (p.max_focus_minutes_per_day, p.busy_calendars) == (300, ["primary"])  # data kept
         assert p.stability_per_hour == 1.0 and p.optimizer_calendar_id is None
+        assert p.claude_monthly_cap_usd == 5.0 and store.list_holds(session) == []
     eng.dispose()
-    assert sqlite3.connect(path).execute("PRAGMA user_version").fetchone()[0] == 2
+    assert sqlite3.connect(path).execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION == 4
 
 
 # ---- Optimizer calendar sync ---------------------------------------------------------
@@ -272,20 +276,19 @@ def test_replan_only_touches_blocks_that_moved(s):
 
 
 def test_in_progress_block_is_trimmed_not_deleted(s):
-    store.add_task(s, title="Essay", total_minutes=60)
+    """Re-planning partway through a block (with the task now done) keeps the part that happened."""
+    t = store.add_task(s, title="Essay", total_minutes=60)
     plan_and_approve(s)
     fake = FakeCalendar()
     optimizer_cal.sync_approved(fake, s, NOW)
     cal_id = store.get_prefs(s).optimizer_calendar_id
     [ev] = fake.optimizer_events(cal_id)
 
-    # Halfway through the block, a new approved plan no longer contains it.
     start = datetime.fromisoformat(ev["start"]["dateTime"])
     midway = start + timedelta(minutes=20)
-    for b in store.approved_blocks(s):
-        s.delete(b)
-    s.commit()
-    result = optimizer_cal.sync_approved(fake, s, midway)
+    store.update_task(s, t.id, status="done")
+    store.plan_now(s, [], midway)  # nothing left, so the new plan is empty
+    _, result = optimizer_cal.approve_and_sync(s, fake, midway)
     assert result.trimmed == 1 and result.deleted == 0
     assert datetime.fromisoformat(fake.events_by_cal[cal_id][ev["id"]]["end"]["dateTime"]) == midway
 
@@ -311,3 +314,134 @@ def test_optimizer_calendar_never_counts_as_busy(s):
     store.update_prefs(s, busy_calendars=["primary@x", cal_id])  # even if chosen by mistake
     events = calendar_sync.busy_events(s, NOW, service=fake)
     assert events == []  # the plan's own blocks don't block time
+
+
+def test_breaks_go_on_the_optimizer_calendar(s):
+    """A hold (e.g. a break) is written on approve, even with no work planned, and removed when deleted."""
+    fake = FakeCalendar()
+    hold = store.add_hold(s, "Break: short walk", at(18, 9), at(18, 9, 30))
+    store.plan_now(s, [], NOW)  # no tasks, so no blocks
+    count, result = optimizer_cal.approve_and_sync(s, fake, NOW)
+    cal_id = store.get_prefs(s).optimizer_calendar_id
+    [ev] = fake.optimizer_events(cal_id)
+    assert count == 0 and result.inserted == 1
+    assert ev["summary"] == "Break: short walk" and ev["colorId"] == optimizer_cal.HOLD_COLOR
+
+    count, result = optimizer_cal.approve_and_sync(s, fake, NOW)  # idempotent
+    assert (result.inserted, result.deleted, result.kept) == (0, 0, 1)
+
+    store.delete_hold(s, hold.id)
+    _, result = optimizer_cal.approve_and_sync(s, fake, NOW)
+    assert result.deleted == 1 and fake.optimizer_events(cal_id) == []
+
+
+def test_breaks_and_blocks_together(s):
+    store.add_task(s, title="Essay", total_minutes=120, deadline=at(18, 12))
+    store.add_hold(s, "Break", at(18, 9), at(18, 9, 30))
+    store.plan_now(s, [], NOW)
+    fake = FakeCalendar()
+    optimizer_cal.approve_and_sync(s, fake, NOW)
+    events = fake.optimizer_events(store.get_prefs(s).optimizer_calendar_id)
+    assert {e["summary"] for e in events} == {"Essay", "Break"}
+    brk = datetime.fromisoformat(next(e for e in events if e["summary"] == "Break")["start"]["dateTime"])
+    for e in events:
+        if e["summary"] == "Essay":  # work stays clear of the break and its buffer
+            start, end = (datetime.fromisoformat(e[k]["dateTime"]) for k in ("start", "end"))
+            assert end + timedelta(minutes=5) <= brk or start >= brk + timedelta(minutes=35)
+
+
+# ---- approve replaces everything from the solve time on ------------------------------------
+
+def test_block_under_way_at_replan_is_cut_off_not_left_behind(s):
+    """Regression: a block that had started when you re-planned stayed on the Optimizer
+    calendar after approving, overlapping the new plan."""
+    fake = FakeCalendar()
+    store.add_task(s, title="PSET", total_minutes=120, deadline=at(19, 23))
+    store.plan_now(s, [], NOW)
+    optimizer_cal.approve_and_sync(s, fake, NOW)
+    [old] = store.approved_blocks(s, NOW)
+    cal_id = store.get_prefs(s).optimizer_calendar_id
+
+    mid = old.start + timedelta(minutes=40)  # re-plan 40 minutes into the block
+    # Something urgent has to go first, so the PSET block doesn't continue right away.
+    store.add_task(s, title="Catchup", total_minutes=60, priority=5, deadline=mid + timedelta(minutes=70))
+    store.plan_now(s, [], mid)
+    optimizer_cal.approve_and_sync(s, fake, mid)
+
+    events = fake.optimizer_events(cal_id)
+    spans = [(datetime.fromisoformat(e["start"]["dateTime"]), datetime.fromisoformat(e["end"]["dateTime"]))
+             for e in events]
+    for i, (s1, e1) in enumerate(spans):  # nothing on the calendar overlaps
+        for s2, e2 in spans[i + 1:]:
+            assert e1 <= s2 or e2 <= s1, f"overlap: {s1}-{e1} and {s2}-{e2}"
+    trimmed = [e for e in events if e["summary"] == "PSET" and datetime.fromisoformat(e["start"]["dateTime"]) == old.start]
+    assert [datetime.fromisoformat(e["end"]["dateTime"]) for e in trimmed] == [mid]  # what happened stays
+    # The database agrees: the old block now ends at the re-plan.
+    assert [(b.start, b.end) for b in store.approved_blocks(s, mid - timedelta(minutes=1))
+            if b.start == old.start] == [(old.start, mid)]
+
+
+def test_approving_an_empty_replan_clears_the_calendar(s):
+    fake = FakeCalendar()
+    t = store.add_task(s, title="Essay", total_minutes=120, deadline=at(19, 23))
+    store.plan_now(s, [], NOW)
+    optimizer_cal.approve_and_sync(s, fake, NOW)
+    cal_id = store.get_prefs(s).optimizer_calendar_id
+    assert fake.optimizer_events(cal_id)
+
+    store.update_task(s, t.id, status="done")
+    store.plan_now(s, [], NOW)  # nothing left to plan
+    assert store.has_unapproved_solve(s)
+    count, result = optimizer_cal.approve_and_sync(s, fake, NOW)
+    assert count == 0 and result.deleted >= 1
+    assert fake.optimizer_events(cal_id) == [] and store.approved_blocks(s, NOW) == []
+    assert not store.has_unapproved_solve(s)
+
+
+def test_replan_after_replan_leaves_only_the_latest(s):
+    fake = FakeCalendar()
+    store.add_task(s, title="A", total_minutes=90, deadline=at(19, 23))
+    for minutes in (0, 50, 130):  # three re-plans, each approved
+        now = NOW + timedelta(minutes=minutes)
+        store.add_task(s, title=f"New {minutes}", total_minutes=60, priority=5, deadline=at(18, 23))
+        store.plan_now(s, [], now)
+        optimizer_cal.approve_and_sync(s, fake, now)
+    cal_id = store.get_prefs(s).optimizer_calendar_id
+    future = {(e["summary"], e["start"]["dateTime"], e["end"]["dateTime"]) for e in fake.optimizer_events(cal_id)
+              if datetime.fromisoformat(e["end"]["dateTime"]) > now}
+    approved = {(t, b.start.isoformat(), b.end.isoformat()) for b in store.approved_blocks(s, now)
+                for t in [{x.id: x.title for x in store.list_tasks(s)}[b.task_id]]}
+    assert len(future) == len(approved)
+
+
+def test_same_task_continuing_merges_into_one_block(s):
+    """Regression: re-planning 4 minutes into a block left a 5-minute sliver next to the
+    same task's new block. If the plan continues the same task, it's one block."""
+    fake = FakeCalendar()
+    store.add_task(s, title="Catchup", total_minutes=60, priority=5, deadline=at(18, 12))
+    store.plan_now(s, [], NOW)
+    optimizer_cal.approve_and_sync(s, fake, NOW)
+    [old] = store.approved_blocks(s, NOW)
+    mid = old.start + timedelta(minutes=4)
+    store.plan_now(s, [], mid)
+    optimizer_cal.approve_and_sync(s, fake, mid)
+    [ev] = fake.optimizer_events(store.get_prefs(s).optimizer_calendar_id)
+    [blk] = store.approved_blocks(s, mid)
+    assert datetime.fromisoformat(ev["start"]["dateTime"]) == blk.start == old.start
+    assert datetime.fromisoformat(ev["end"]["dateTime"]) == blk.end > old.end - timedelta(minutes=1)
+
+
+def test_short_sliver_of_a_replaced_block_is_dropped(s):
+    fake = FakeCalendar()
+    store.add_task(s, title="PSET", total_minutes=120, deadline=at(19, 23))
+    store.plan_now(s, [], NOW)
+    optimizer_cal.approve_and_sync(s, fake, NOW)
+    [old] = store.approved_blocks(s, NOW)
+    mid = old.start + timedelta(minutes=4)
+    store.add_task(s, title="Urgent", total_minutes=60, priority=5, deadline=mid + timedelta(minutes=70))
+    store.plan_now(s, [], mid)
+    optimizer_cal.approve_and_sync(s, fake, mid)
+    events = fake.optimizer_events(store.get_prefs(s).optimizer_calendar_id)
+    assert all(datetime.fromisoformat(e["end"]["dateTime"]) - datetime.fromisoformat(e["start"]["dateTime"])
+               >= timedelta(minutes=30) for e in events)
+    assert old.start not in [b.start for b in store.approved_blocks(s, NOW)]

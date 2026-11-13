@@ -6,19 +6,23 @@ the Claude Desktop helper all share one set of rules.
 
 from __future__ import annotations
 
-from datetime import datetime, time, timedelta, tzinfo
+from dataclasses import asdict
+from datetime import datetime, time, timedelta, timezone, tzinfo
 from zoneinfo import ZoneInfo
 
 from sqlmodel import Session, col, delete, select
 from tzlocal import get_localzone_name
 
 from . import domain
+from .diagnose import diagnose
 from .domain import EventInput, Plan, TaskInput, WeeklyTask
 from .solver import solve
 from .tables import (
     BlockStatus,
     EffortMode,
     EventMeta,
+    Hold,
+    LastSolve,
     PlanBlock,
     Preferences,
     ProgressLog,
@@ -44,7 +48,7 @@ PREF_FIELDS = {
     "awake_start", "awake_end", "max_focus_minutes_per_day", "buffer_minutes", "horizon_days",
     "time_zone", "busy_calendars", "claude_mode", "setup_complete",
     "chunk_cost", "ideal_deviation_per_hour", "time_of_day_bonus_per_hour", "stability_per_hour",
-    "optimizer_calendar_id",
+    "optimizer_calendar_id", "claude_monthly_cap_usd",
 }
 
 
@@ -283,26 +287,117 @@ def _db_task_id(solver_task_id: str) -> int:
     return int(solver_task_id.split("@", 1)[0])  # weekly instances look like "7@2026-11-16"
 
 
-def save_proposed_plan(s: Session, plan: Plan) -> list[PlanBlock]:
+def save_proposed_plan(s: Session, plan: Plan, now: datetime | None = None) -> list[PlanBlock]:
+    """Replace the proposed blocks. `solved_at` records the time the plan starts from."""
+    now = now or datetime.now(timezone.utc)
     s.exec(delete(PlanBlock).where(PlanBlock.status == BlockStatus.PROPOSED))
-    rows = [PlanBlock(task_id=_db_task_id(b.task_id), start=b.start, end=b.end, score=b.score) for b in plan.blocks]
+    rows = [PlanBlock(task_id=_db_task_id(b.task_id), start=b.start, end=b.end, score=b.score, solved_at=now)
+            for b in plan.blocks]
     s.add_all(rows)
     s.commit()
     return rows
 
 
-def plan_now(s: Session, busy_events: list[EventInput], now: datetime) -> Plan:
-    """Solve from the database and the given calendar events; store the result as proposed."""
+def plan_now(
+    s: Session, busy_events: list[EventInput], now: datetime, explain: bool = True, source: str = "app",
+) -> Plan:
+    """Solve from the database and the given calendar events; store the result as proposed.
+
+    With `explain`, unmet deadline work is diagnosed (a few extra seconds) and the
+    conflicts are saved with the solve summary.
+    """
     prefs = get_prefs(s)
     tasks, weekly = solver_inputs(s, now)
-    events = apply_event_settings(s, busy_events)
+    events = apply_event_settings(s, busy_events) + hold_events(s, now)
     previous: dict[str, list[tuple[datetime, datetime]]] = {}
     for b in approved_blocks(s, now):
         previous.setdefault(str(b.task_id), []).append((b.start, b.end))
-    plan = solve(tasks, events, solver_prefs(prefs), now, weekly=weekly, previous=previous)
+    sp = solver_prefs(prefs)
+    plan = solve(tasks, events, sp, now, weekly=weekly, previous=previous)
     if plan.status in ("OPTIMAL", "FEASIBLE"):
-        save_proposed_plan(s, plan)
+        save_proposed_plan(s, plan, now)
+    conflicts = diagnose(plan, tasks, events, sp, now, weekly) if explain and plan.unmet_minutes else []
+    save_last_solve(s, plan, events, conflicts, source, now)
     return plan
+
+
+# ---- solve summary (shared by the app window and the Claude Desktop helper) ----------
+
+
+def _event_dict(e: EventInput, attend: bool) -> dict:
+    return {"id": e.id, "title": e.title, "start": e.start.isoformat(), "end": e.end.isoformat(),
+            "skippable": e.skippable, "skip_cost": e.skip_cost, "attend": attend}
+
+
+def save_last_solve(s: Session, plan: Plan, events: list[EventInput], conflicts: list, source: str,
+                    now: datetime | None = None) -> LastSolve:
+    """`now` is the time the plan starts from (the solve time)."""
+    skipped = {e.event_id for e in plan.skipped}
+    row = s.get(LastSolve, 1) or LastSolve(id=1)
+    row.solved_at = now or datetime.now(timezone.utc)
+    row.approved_at = None  # a new solve waits for Approve plan
+    row.status = plan.status
+    row.objective_points = plan.objective_points
+    row.wall_seconds = plan.wall_seconds
+    row.unmet = dict(plan.unmet_minutes)
+    row.events = [_event_dict(e, e.id not in skipped) for e in events]
+    row.conflicts = [asdict(c) for c in conflicts]
+    row.source = source
+    s.add(row)
+    s.commit()
+    s.refresh(row)
+    return row
+
+
+def last_solve(s: Session) -> LastSolve | None:
+    return s.get(LastSolve, 1)
+
+
+def solve_events(row: LastSolve | None) -> list[EventInput]:
+    """The events saved with the last solve, as EventInputs (for display)."""
+    out = []
+    for e in (row.events if row else []):
+        out.append(EventInput(e["id"], e["title"], datetime.fromisoformat(e["start"]),
+                              datetime.fromisoformat(e["end"]), e["skippable"], e["skip_cost"]))
+    return out
+
+
+# ---- holds: app-only busy time (e.g. a break) ---------------------------------------
+
+
+def add_hold(s: Session, title: str, start: datetime, end: datetime) -> Hold:
+    if not title.strip():
+        raise ValueError("title is required")
+    if start.tzinfo is None or end.tzinfo is None:
+        raise ValueError("start and end must include a time zone")
+    if end <= start:
+        raise ValueError("end must be after start")
+    if end - start > timedelta(days=1):
+        raise ValueError("a hold can be at most one day long")
+    hold = Hold(title=title.strip(), start=start, end=end)
+    s.add(hold)
+    s.commit()
+    s.refresh(hold)
+    return hold
+
+
+def list_holds(s: Session, now: datetime | None = None) -> list[Hold]:
+    q = select(Hold).order_by(Hold.start)
+    if now is not None:
+        q = q.where(Hold.end > now)
+    return list(s.exec(q))
+
+
+def delete_hold(s: Session, hold_id: int) -> None:
+    hold = s.get(Hold, hold_id)
+    if hold is None:
+        raise KeyError(f"no hold with id {hold_id}")
+    s.delete(hold)
+    s.commit()
+
+
+def hold_events(s: Session, now: datetime) -> list[EventInput]:
+    return [EventInput(f"hold:{h.id}", h.title, h.start, h.end) for h in list_holds(s, now)]
 
 
 def proposed_blocks(s: Session) -> list[PlanBlock]:
@@ -326,18 +421,57 @@ def upcoming_blocks(s: Session, now: datetime) -> list[PlanBlock]:
     return list(s.exec(q.order_by(PlanBlock.start)))
 
 
-def approve_plan(s: Session) -> int:
-    """Replace future approved blocks with the proposed ones. Returns how many were approved.
+MIN_KEPT_MINUTES = 15  # an under-way block cut shorter than this is dropped, not kept as a sliver
+CONTINUE_WITHIN_MINUTES = 10  # a new block of the same task starting this soon continues the old one
 
-    Writing them to the Optimizer calendar happens in Phase 6.
+
+def has_unapproved_solve(s: Session) -> bool:
+    row = last_solve(s)
+    return row is not None and row.status in ("OPTIMAL", "FEASIBLE") and row.approved_at is None
+
+
+def approve_plan(s: Session) -> int:
+    """Make the latest solve the approved plan. Returns how many blocks were approved.
+
+    The solve planned everything from its own start time, so every approved block from
+    then on is replaced. A block that was under way at the solve is handled so nothing
+    odd is left behind:
+    - if the new plan continues the same task right away, the two merge into one block;
+    - if less than MIN_KEPT_MINUTES of it had passed, it's dropped;
+    - otherwise it's cut off at the solve time (what happened before stays).
+    An empty solve, e.g. once all work is done, clears the future approved blocks too.
     """
     proposed = proposed_blocks(s)
-    if not proposed:
+    count = len(proposed)
+    row = last_solve(s)
+    if not proposed and not has_unapproved_solve(s):
         return 0
-    first = min(b.start for b in proposed)
-    s.exec(delete(PlanBlock).where(PlanBlock.status == BlockStatus.APPROVED, PlanBlock.start >= first))
+    starts = [b.solved_at for b in proposed] + ([row.solved_at] if row else [])
+    cutoff = min(starts)
+    for b in approved_blocks(s, cutoff):  # approved blocks that hadn't ended at the solve
+        if b.start >= cutoff:
+            s.delete(b)
+            continue
+        cont = next((p for p in proposed if p.task_id == b.task_id
+                     and p.start - cutoff <= timedelta(minutes=CONTINUE_WITHIN_MINUTES)), None)
+        if cont is not None:  # same task picks up where it was: one block, keeping its calendar event
+            b.end, b.score = cont.end, cont.score
+            proposed.remove(cont)
+            s.delete(cont)
+            s.add(b)
+        else:
+            # Cut on the 5-minute grid, so the calendar shows 7:00 rather than 7:04:56.
+            cut = cutoff.replace(second=0, microsecond=0) - timedelta(minutes=cutoff.minute % 5)
+            if cut - b.start < timedelta(minutes=MIN_KEPT_MINUTES):
+                s.delete(b)
+            else:
+                b.end = cut
+                s.add(b)
     for b in proposed:
         b.status = BlockStatus.APPROVED
         s.add(b)
+    if row is not None:
+        row.approved_at = datetime.now(timezone.utc)
+        s.add(row)
     s.commit()
-    return len(proposed)
+    return count

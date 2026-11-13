@@ -6,8 +6,8 @@ import pytest
 from nicegui import ui
 from nicegui.testing.user_simulation import user_simulation
 
-from schedule_optimizer import db, google_auth, store, ui_app
-from schedule_optimizer.tables import Task
+from schedule_optimizer import changes, claude_api, db, google_auth, store, ui_app
+from schedule_optimizer.tables import ClaudeMode, Task
 
 
 @pytest.fixture
@@ -15,7 +15,9 @@ def app_db(tmp_path, monkeypatch):
     monkeypatch.setenv("SCHEDULE_OPTIMIZER_DATA_DIR", str(tmp_path))
     monkeypatch.setattr(db, "_engine", None)
     monkeypatch.setattr(google_auth, "is_signed_in", lambda: False)  # offline: never touch Google
+    monkeypatch.setenv("SCHEDULE_OPTIMIZER_OFFLINE", "1")
     ui_app.STATE.update(plan=None, events=[], error=None, solved_at=None)
+    ui_app.CHAT.__init__()
     with db.session() as s:
         store.update_prefs(s, time_zone="America/Los_Angeles")
     yield
@@ -136,3 +138,74 @@ async def test_preferences_tab_rejects_bad_times(app_db):
         user.find(marker="pref-awake-end").clear().type("06:00")
         user.find(marker="prefs-save").click()
         await user.should_see("awake_end must be after awake_start")
+
+
+# ---- Phase 7 ---------------------------------------------------------------------------
+
+def local_now():
+    with db.session() as s:
+        return datetime.now(store.local_tz(store.get_prefs(s)))
+
+
+async def test_unmet_work_explains_why(app_db):
+    finish_setup()
+    now = local_now()
+    with db.session() as s:
+        store.add_task(s, title="Paper", total_minutes=24 * 60, deadline=now + timedelta(hours=26))
+    async with user_simulation(root=ui_app.root) as user:
+        await user.open("/")
+        user.find(marker="replan").click()
+        await user.should_see("Unmet: Paper", retries=200)
+        [task] = store_tasks()
+        await user.should_see(marker=f"why-{task.id}")
+
+
+def store_tasks():
+    with db.session() as s:
+        return store.list_tasks(s)
+
+
+async def test_proposal_can_be_applied_from_the_now_tab(app_db):
+    finish_setup()
+    now = local_now()
+    with db.session() as s:
+        t = store.add_task(s, title="Essay", total_minutes=60)
+        row = changes.propose(s, [{"op": "update_task", "task_id": t.id, "priority": 5}],
+                              "Make the essay top priority", [], now)
+    async with user_simulation(root=ui_app.root) as user:
+        await user.open("/")
+        await user.should_see("Make the essay top priority")
+        user.find(marker=f"apply-{row.id}").click()
+        await user.should_see("Applied", retries=100)
+    with db.session() as s:
+        assert store.list_tasks(s)[0].priority == 5
+        assert changes.pending(s) == []
+
+
+async def test_desktop_mode_shows_config_snippet(app_db):
+    finish_setup()
+    with db.session() as s:
+        store.update_prefs(s, claude_mode=ClaudeMode.DESKTOP)
+    async with user_simulation(root=ui_app.root) as user:
+        await user.open("/")
+        user.find("Preferences").click()
+        await user.should_see("Settings › Developer › Edit Config", retries=50)
+    assert ui_app.desktop_config()["mcpServers"]["schedule-optimizer"]["args"][-1] == "schedule-optimizer-mcp"
+
+
+async def test_api_mode_chat_tab(app_db, monkeypatch):
+    finish_setup()
+    with db.session() as s:
+        store.update_prefs(s, claude_mode=ClaudeMode.API_KEY)
+    monkeypatch.setattr(claude_api, "has_key", lambda: True)
+
+    def fake_send(text):
+        ui_app.CHAT.log += [("user", text), ("claude", "Take a 20-minute walk first.")]
+
+    monkeypatch.setattr(ui_app, "_send_chat", fake_send)
+    async with user_simulation(root=ui_app.root) as user:
+        await user.open("/")
+        user.find("Claude").click()
+        user.find(marker="chat-input").type("I'm tired")
+        user.find(marker="chat-send").click()
+        await user.should_see("Take a 20-minute walk first.", retries=100)

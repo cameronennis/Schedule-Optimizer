@@ -125,6 +125,7 @@ class Preferences(SQLModel, table=True):
     time_of_day_bonus_per_hour: float = 1.0
     stability_per_hour: float = 1.0  # added in schema v2
     optimizer_calendar_id: str | None = None  # the app's own Google calendar (schema v2)
+    claude_monthly_cap_usd: float = 5.0  # API-key mode spending cap (schema v3)
 
 
 class ProgressLog(SQLModel, table=True):
@@ -144,3 +145,61 @@ class PlanBlock(SQLModel, table=True):
     google_event_id: str | None = None  # set once written to the Optimizer calendar
     score: dict = Field(default_factory=dict, sa_column=Column(JSON))  # for "why?"
     solved_at: datetime = _dt(default_factory=utcnow)
+
+
+# ---- schema v3: Claude integration ------------------------------------------------
+
+
+class ProposalStatus(str, Enum):
+    PENDING = "pending"
+    APPLIED = "applied"
+    DISMISSED = "dismissed"
+
+
+class Proposal(SQLModel, table=True):
+    """A set of input changes Claude suggested. Nothing changes until you apply it."""
+
+    id: int | None = Field(default=None, primary_key=True)
+    created_at: datetime = _dt(default_factory=utcnow)
+    source: str = "claude"  # "claude-desktop" or "api"
+    summary: str = ""
+    changes: list = Field(default_factory=list, sa_column=Column(JSON))
+    preview: dict = Field(default_factory=dict, sa_column=Column(JSON))  # before/after, for review
+    status: ProposalStatus = ProposalStatus.PENDING
+    decided_at: datetime | None = _dt(default=None)
+
+
+class Hold(SQLModel, table=True):
+    """Time set aside, such as a break. Blocks planning, and is written to the Optimizer
+    calendar (never your other calendars) on Approve plan."""
+
+    id: int | None = Field(default=None, primary_key=True)
+    title: str
+    start: datetime = _dt()
+    end: datetime = _dt()
+    created_at: datetime = _dt(default_factory=utcnow)
+
+
+class LastSolve(SQLModel, table=True):
+    """A summary of the latest solve (single row, id = 1), so the app window and the
+    Claude Desktop helper see the same plan details."""
+
+    id: int = Field(default=1, primary_key=True)
+    solved_at: datetime = _dt(default_factory=utcnow)
+    status: str = ""
+    objective_points: float = 0.0
+    wall_seconds: float = 0.0
+    unmet: dict = Field(default_factory=dict, sa_column=Column(JSON))  # solver task id → minutes
+    events: list = Field(default_factory=list, sa_column=Column(JSON))  # busy events with attend decisions
+    conflicts: list = Field(default_factory=list, sa_column=Column(JSON))
+    source: str = "app"  # who ran it: app, cli, claude-desktop, api
+    approved_at: datetime | None = _dt(default=None)  # when this solve was approved; None until then (schema v4)
+
+
+class ApiUsage(SQLModel, table=True):
+    """Spending per calendar month in API-key mode, to enforce the monthly cap."""
+
+    month: str = Field(primary_key=True)  # "2026-11"
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cost_usd: float = 0.0

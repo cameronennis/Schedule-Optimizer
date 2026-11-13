@@ -132,3 +132,36 @@ class Plan:
     @property
     def skipped(self) -> list[EventDecision]:
         return [e for e in self.events if not e.attend]
+
+
+@dataclass
+class Rule:
+    """One rule that can be switched off when diagnosing why work doesn't fit.
+
+    kind: deadline, earliest_start, min_block, focus_cap, awake, event, attend.
+    """
+
+    kind: str
+    label: str
+    task_id: str | None = None
+    event_ids: list[str] = field(default_factory=list)
+    day: str | None = None  # ISO date, for focus_cap and awake
+
+
+@dataclass
+class Conflict:
+    """Why a task's remaining work didn't fit.
+
+    kind:
+    - "rules": these rules together make it impossible; relaxing any one of them helps.
+    - "competition": it would fit alone; other tasks used the time (see `competing`).
+    - "too_big": more work than the whole planning window holds, even with rules relaxed.
+    - "unknown": the diagnosis ran out of time.
+    """
+
+    task_id: str
+    title: str
+    unmet_minutes: int
+    kind: str
+    rules: list[Rule] = field(default_factory=list)
+    competing: dict[str, int] = field(default_factory=dict)  # task title → planned minutes before the deadline

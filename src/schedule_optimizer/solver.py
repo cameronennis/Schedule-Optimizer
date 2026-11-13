@@ -16,7 +16,7 @@ Model summary (see docs/PLAN.md, "Optimizer model in CP-SAT"):
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, time
 
 from ortools.sat.python import cp_model
 
@@ -27,6 +27,7 @@ from .domain import (
     Plan,
     PlanBlock,
     Preferences,
+    Rule,
     TaskInput,
     TimeOfDay,
     WeeklyTask,
@@ -73,14 +74,37 @@ class _Model:
     remaining_slots: dict[str, int] = field(default_factory=dict)
 
 
-def _merge(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
-    merged: list[tuple[int, int]] = []
-    for lo, hi in sorted(spans):
+def _merge(spans: list[tuple[int, int, EventInput]]) -> list[tuple[int, int, list[EventInput]]]:
+    """Merge overlapping event spans, remembering which events each merged span holds."""
+    merged: list[tuple[int, int, list[EventInput]]] = []
+    for lo, hi, e in sorted(spans, key=lambda x: (x[0], x[1])):
         if merged and lo <= merged[-1][1]:
-            merged[-1] = (merged[-1][0], max(merged[-1][1], hi))
+            mlo, mhi, members = merged[-1]
+            merged[-1] = (mlo, max(mhi, hi), members + [e])
         else:
-            merged.append((lo, hi))
+            merged.append((lo, hi, [e]))
     return merged
+
+
+def _when(dt: datetime) -> str:
+    return f"{dt:%a %b} {dt.day} {dt:%H:%M}"  # no %-d: it isn't portable to Windows
+
+
+@dataclass
+class _Diag:
+    """Diagnosis mode: one task must be fully placed, and each rule that could be
+    relaxed gets an on/off literal passed to CP-SAT as an assumption."""
+
+    required: str
+    attended: set[str]
+    lits: dict[str, tuple[cp_model.IntVar, Rule]] = field(default_factory=dict)
+    need: cp_model.IntVar | None = None  # when true, all remaining work must be placed
+    required_slots: int = 0
+
+    def lit(self, m: cp_model.CpModel, key: str, rule: Rule) -> cp_model.IntVar:
+        if key not in self.lits:
+            self.lits[key] = (m.new_bool_var(f"assume[{key}]"), rule)
+        return self.lits[key][0]
 
 
 def build_model(
@@ -89,10 +113,15 @@ def build_model(
     prefs: Preferences,
     now: datetime,
     previous: dict[str, list[tuple[datetime, datetime]]] | None = None,
+    diag: _Diag | None = None,
 ) -> _Model:
     """`previous` maps a task id (weekly instances share their base id) to the blocks
     the last approved plan gave it. Overlapping them earns a small stability bonus, so
-    a re-plan only moves blocks when that gains more than the bonus."""
+    a re-plan only moves blocks when that gains more than the bonus.
+
+    With `diag`, the model has no objective: it asks whether `diag.required` can be
+    fully placed, with deadlines, awake hours, focus caps, events and minimum block
+    sizes switchable through assumption literals (see diagnose())."""
     grid = TimeGrid.starting(now, prefs.horizon_days)
     m = cp_model.CpModel()
     out = _Model(model=m, grid=grid)
@@ -102,6 +131,14 @@ def build_model(
     dates = grid.local_dates()
     awake = {d: grid.local_window(d, prefs.awake_start, prefs.awake_end) for d in dates}
     awake = {d: w for d, w in awake.items() if w}
+    # In diagnosis, awake hours are a rule that can be switched off, so a chunk may use the whole day.
+    full_days = {d: w for d in dates if (w := grid.local_window(d, time(0), time(0)))}
+    windows = full_days if diag else awake
+    awake_lit = {
+        d: diag.lit(m, f"awake:{d}", Rule("awake", f"Awake hours {prefs.awake_start:%H:%M}–"
+                                                  f"{prefs.awake_end:%H:%M} on {d:%a %b} {d.day}", day=d.isoformat()))
+        for d in windows
+    } if diag else {}
 
     intervals: list[cp_model.IntervalVar] = []
     objective: list = []
@@ -112,15 +149,23 @@ def build_model(
         lo, hi = grid.clamp(grid.to_slot_floor(e.start)), grid.clamp(grid.to_slot_ceil(e.end))
         return (lo, hi) if lo < hi else None
 
-    fixed = [s for e in events if not e.skippable and (s := span(e))]
+    fixed = [(*s, e) for e in events if not e.skippable and (s := span(e))]
     # Events short enough to sit inside a same-task break; an event between two blocks
     # is itself the break, so those blocks may be closer than SAME_TASK_BREAK_MINUTES.
     break_slots = max(buf, minutes_to_slots(SAME_TASK_BREAK_MINUTES))
     short_events: list[tuple[int, int, cp_model.IntVar | None]] = []
-    for lo, hi in _merge(fixed):
-        intervals.append(m.new_fixed_size_interval_var(lo, hi - lo + buf, "fixed"))
+    for lo, hi, members in _merge(fixed):
+        present = None
+        if diag:
+            names = " + ".join(f"“{e.title}”" for e in members)
+            rule = Rule("event", f"{names} {_when(grid.to_datetime(lo))}–{grid.to_datetime(hi):%H:%M}",
+                        event_ids=[e.id for e in members])
+            present = diag.lit(m, f"event:{lo}:{hi}", rule)
+            intervals.append(m.new_optional_fixed_size_interval_var(lo, hi - lo + buf, present, "fixed"))
+        else:
+            intervals.append(m.new_fixed_size_interval_var(lo, hi - lo + buf, "fixed"))
         if hi - lo + 2 * buf < break_slots:
-            short_events.append((lo, hi, None))
+            short_events.append((lo, hi, present))
 
     for e in events:
         if not e.skippable or not (s := span(e)):
@@ -128,13 +173,17 @@ def build_model(
         lo, hi = s
         attend = m.new_bool_var(f"attend[{e.id}]")
         out.attend[e.id] = attend
+        if diag and e.id in diag.attended:
+            rule = Rule("attend", f"Attending “{e.title}” {_when(e.start.astimezone(grid.tz))} "
+                                  f"(skip cost {e.skip_cost:g})", event_ids=[e.id])
+            m.add_implication(diag.lit(m, f"attend:{e.id}", rule), attend)
         intervals.append(m.new_optional_fixed_size_interval_var(lo, hi - lo + buf, attend, f"ev[{e.id}]"))
         if hi - lo + 2 * buf < break_slots:
             short_events.append((lo, hi, attend))  # only a break if attended
         cost = round(e.skip_cost * SCALE)
         objective.append(cost * attend - cost)  # lose skip_cost points if not attended
 
-    day_loads: dict = {d: [] for d in awake}
+    day_loads: dict = {d: [] for d in windows}
     f_units = round(prefs.chunk_cost * SCALE)
     a_units = _units_per_slot(prefs.ideal_deviation_per_hour)
     b_units = _units_per_slot(prefs.time_of_day_bonus_per_hour)
@@ -148,7 +197,25 @@ def build_model(
             continue
         lo_b = grid.clamp(grid.to_slot_ceil(task.earliest_start)) if task.earliest_start else 0
         hi_b = grid.clamp(grid.to_slot_floor(task.deadline)) if task.deadline else grid.num_slots
-        days = {d: w for d, w in awake.items() if w[0] < hi_b and w[1] > lo_b}
+        required = diag is not None and task.id == diag.required
+        if diag is not None and not required:
+            continue  # optional tasks can't make the required one infeasible
+        deadline_lit = start_lit = min_lit = None
+        if required:
+            # Deadline, earliest start and shortest block become switchable rules.
+            if task.deadline:
+                deadline_lit = diag.lit(m, "deadline", Rule(
+                    "deadline", f"{task.title} due {_when(task.deadline.astimezone(grid.tz))}", task_id=task.id))
+            if task.earliest_start:
+                start_lit = diag.lit(m, "earliest_start", Rule(
+                    "earliest_start", f"{task.title} can't start before "
+                                      f"{_when(task.earliest_start.astimezone(grid.tz))}", task_id=task.id))
+            if task.min_block > SLOT_MINUTES:
+                min_lit = diag.lit(m, "min_block", Rule(
+                    "min_block", f"{task.title} shortest block {task.min_block} min", task_id=task.id))
+            deadline_slot, start_slot = hi_b, lo_b
+            lo_b, hi_b = 0, grid.num_slots
+        days = {d: w for d, w in windows.items() if w[0] < hi_b and w[1] > lo_b}
         if lo_b >= hi_b or not days:
             continue
 
@@ -156,7 +223,7 @@ def build_model(
         # max_block is soft: a block may run longer (up to the day's focus cap) when
         # that's the only way to get the work done, at a small penalty per extra hour.
         soft_max = max(min_len, min(minutes_to_slots(task.max_block), rem))
-        max_len = max(soft_max, min(rem, cap))
+        max_len = max(soft_max, min(rem, 24 * SLOTS_PER_HOUR if required else cap))
         ideal = max(min_len, min(minutes_to_slots(task.ideal_block), soft_max))
         k_max = min(-(-rem // min_len), MAX_CHUNKS_PER_TASK)
 
@@ -176,8 +243,14 @@ def build_model(
             name = f"{task.id}#{k}"
             p = m.new_bool_var(f"p[{name}]")
             s = m.new_int_var(lo_b, hi_b, f"s[{name}]")
-            length = m.new_int_var(min_len, max_len, f"len[{name}]")
+            length = m.new_int_var(1 if min_lit is not None else min_len, max_len, f"len[{name}]")
             m.add(s + length <= hi_b).only_enforce_if(p)
+            if deadline_lit is not None:
+                m.add(s + length <= deadline_slot).only_enforce_if([p, deadline_lit])
+            if start_lit is not None:
+                m.add(s >= start_slot).only_enforce_if([p, start_lit])
+            if min_lit is not None:
+                m.add(length >= min_len).only_enforce_if([p, min_lit])
             # Pin absent chunks so the solver doesn't explore meaningless values.
             m.add(s == lo_b).only_enforce_if(~p)
             m.add(length == min_len).only_enforce_if(~p)
@@ -193,6 +266,12 @@ def build_model(
                 on_day[d] = x
                 m.add(s >= dlo).only_enforce_if(x)
                 m.add(s + length <= dhi).only_enforce_if(x)
+                if diag:  # `days` are whole days here; awake hours apply when their rule is on
+                    if (aw := awake.get(d)) is None:
+                        m.add_bool_or([~x, ~awake_lit[d]])
+                    else:
+                        m.add(s >= aw[0]).only_enforce_if([x, awake_lit[d]])
+                        m.add(s + length <= aw[1]).only_enforce_if([x, awake_lit[d]])
                 day_len = m.new_int_var(0, max_len, f"dlen[{name},{d}]")
                 m.add(day_len == length).only_enforce_if(x)
                 m.add(day_len == 0).only_enforce_if(~x)
@@ -275,14 +354,27 @@ def build_model(
                     m.add_implication(z, att)
                 options.append(z)
             m.add_bool_or(options).only_enforce_if(b.present)
-        m.add(sum(c.placed_len for c in task_chunks) <= rem)
+        placed_total = sum(c.placed_len for c in task_chunks)
+        m.add(placed_total <= rem)
+        if required:
+            diag.need = m.new_bool_var("need_all")
+            diag.required_slots = rem
+            m.add(placed_total == rem).only_enforce_if(diag.need)
+            # Maximizing placed work lets a solve also answer "does it fit?" through its
+            # bound, which CP-SAT proves faster than plain feasibility.
+            m.maximize(placed_total)
         out.chunks.extend(task_chunks)
 
-    for loads in day_loads.values():
+    for d, loads in day_loads.items():
         if loads:
-            m.add(sum(loads) <= cap)
+            ct = m.add(sum(loads) <= cap)
+            if diag:
+                h = prefs.max_focus_minutes_per_day / 60
+                ct.only_enforce_if(diag.lit(m, f"cap:{d}", Rule(
+                    "focus_cap", f"Max focus {h:g} h on {d:%a %b} {d.day}", day=d.isoformat())))
     m.add_no_overlap(intervals)
-    m.maximize(sum(objective))
+    if diag is None:
+        m.maximize(sum(objective))
     return out
 
 

@@ -177,7 +177,10 @@ def _print_sync(result) -> None:
 def cmd_approve(args, s, tz):
     service = None if args.no_sync or not google_auth.is_signed_in() else connect()
     n, result = optimizer_cal.approve_and_sync(s, service)
-    print(f"Approved {n} blocks." if n else "Nothing to approve; run `schedule-optimizer plan` first.")
+    if n:
+        print(f"Approved {n} blocks.")
+    elif not result:
+        print("Nothing to approve; run `schedule-optimizer plan` first.")
     if result:
         _print_sync(result)
 

@@ -1,16 +1,18 @@
 [project]
 name = "schedule-optimizer"
 version = "0.1.0"
-description = "Add your description here"
+description = "Plan tasks around Google Calendar with OR-Tools CP-SAT"
 readme = "README.md"
 authors = [
     { name = "cameronennis", email = "cameron.bruce.ennis@gmail.com" }
 ]
 requires-python = ">=3.12"
 dependencies = [
+    "anthropic>=2.8.0",
     "google-api-python-client>=2.202.0",
     "google-auth-oauthlib>=1.5.0",
     "keyring>=25.7.0",
+    "mcp>=1",
     "nicegui[native]>=4.0.0",
     "ortools>=9.15.6755",
     "platformdirs>=4.14.5",
@@ -22,6 +24,7 @@ dependencies = [
 [project.scripts]
 schedule-optimizer = "schedule_optimizer.cli:main"
 schedule-optimizer-app = "schedule_optimizer.app:main"
+schedule-optimizer-mcp = "schedule_optimizer.mcp_server:main"
 
 [build-system]
 requires = ["uv_build>=0.13.7,<0.14.0"]

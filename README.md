@@ -19,6 +19,22 @@ uv run schedule-optimizer-app --browser   # same UI in a browser tab (http://127
 
 The first launch walks through setup: your day, Google sign-in, and which calendars block time.
 
+## Claude (optional)
+
+Claude never places blocks. It proposes changes to tasks, event skip costs, preferences and holds (time set aside, such as a break). You approve them, and the solver re-plans. Pick a mode in Preferences › Claude.
+
+**Claude Desktop** (uses your Claude plan). During development, add the helper to Claude Desktop's config (Settings › Developer › Edit Config), then fully quit and reopen Claude Desktop. Preferences shows the exact entry for this checkout; it looks like:
+
+```json
+{"mcpServers": {"schedule-optimizer": {
+  "command": "/Users/you/.local/bin/uv",
+  "args": ["run", "--directory", "/path/to/Schedule Optimizer", "schedule-optimizer-mcp"]}}}
+```
+
+Tools: `get_plan`, `get_tasks`, `create_task`, `propose_changes`, `apply_changes`, `solve`, `explain_block`. Claude Desktop asks before running the ones that change things. New plans, and breaks, still need **Approve plan** in the app before they're written to the Optimizer calendar.
+
+**API key** (billed per use). Paste a key from the Claude Console in Preferences; it's stored in the OS keychain. A Claude tab appears for chatting, with a monthly spending cap. In this mode Claude can only propose; you click **Apply** in the app.
+
 ## Command line
 
 ```bash

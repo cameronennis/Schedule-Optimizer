@@ -1025,13 +1025,17 @@ def root_view() -> None:
     if not done:
         setup_view()
         return
-    with ui.tabs().classes("w-full") as tabs:
+    # Redraws (e.g. after changing the Claude mode) keep you on the tab you were on.
+    names = ["Now", "Claude", "Tasks", "Events", "Preferences"] if mode == ClaudeMode.API_KEY \
+        else ["Now", "Tasks", "Events", "Preferences"]
+    current = STATE.get("tab") if STATE.get("tab") in names else "Now"
+    with ui.tabs(value=current, on_change=lambda e: STATE.update(tab=e.value)).classes("w-full") as tabs:
         now_tab = ui.tab("Now", icon="today")
         chat_tab = ui.tab("Claude", icon="chat") if mode == ClaudeMode.API_KEY else None
         tasks_tab = ui.tab("Tasks", icon="checklist")
         events_tab = ui.tab("Events", icon="event")
         prefs_tab = ui.tab("Preferences", icon="tune")
-    with ui.tab_panels(tabs, value=now_tab).classes("w-full"):
+    with ui.tab_panels(tabs, value=current).classes("w-full"):
         with ui.tab_panel(now_tab):
             now_view()
         if chat_tab is not None:

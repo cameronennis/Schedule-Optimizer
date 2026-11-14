@@ -19,6 +19,7 @@ def app_db(tmp_path, monkeypatch):
     monkeypatch.setenv("SCHEDULE_OPTIMIZER_OFFLINE", "1")
     ui_app.STATE.update(plan=None, events=[], error=None, solved_at=None)
     ui_app.CHAT.__init__()
+    ui_app.STATE.pop("tab", None)
     with db.session() as s:
         store.update_prefs(s, time_zone="America/Los_Angeles")
     yield
@@ -257,3 +258,18 @@ async def test_start_a_claude_chat_copies_the_activation_message(app_db):
         await user.should_see("ACTIVATE SCHEDULE OPTIMIZER FOR THIS CHAT")
     with db.session() as s:
         assert len(store.active_chat_codes(s)) == 1
+
+
+
+async def test_changing_claude_mode_stays_on_preferences(app_db, monkeypatch):
+    """Regression: choosing API key mode jumped to the Now tab before you could paste the key."""
+    finish_setup()
+    monkeypatch.setattr(claude_api, "has_key", lambda: False)  # never read the real keychain
+    async with user_simulation(root=ui_app.root) as user:
+        await user.open("/")
+        user.find("Preferences").click()
+        [mode] = user.find(marker="claude-mode").elements
+        mode.set_value(ClaudeMode.API_KEY.value)
+        await user.should_see(marker="api-key")  # the key field, on the Preferences tab
+        assert ui_app.STATE["tab"] == "Preferences"
+        await user.should_see("Claude")  # the new Claude tab appeared too

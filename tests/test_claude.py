@@ -387,3 +387,22 @@ def test_done_tasks_are_deleted_after_seven_days(s):
 
     store.update_task(s, keep.id, status="active")  # reopening clears the completion time
     assert s.get(type(keep), keep.id).completed_at is None
+
+
+
+def test_clipboard_uses_the_system_tool(monkeypatch):
+    import subprocess
+
+    from schedule_optimizer import clipboard
+
+    runs = []
+    monkeypatch.setattr(subprocess, "run", lambda cmd, input, check, timeout: runs.append((cmd, input)))
+    monkeypatch.setattr(clipboard.sys, "platform", "darwin")
+    assert clipboard.copy("ACTIVATE (code ABC-DEF)")
+    assert runs == [(["pbcopy"], b"ACTIVATE (code ABC-DEF)")]
+
+    def fail(*a, **k):
+        raise FileNotFoundError("pbcopy")
+
+    monkeypatch.setattr(subprocess, "run", fail)
+    assert clipboard.copy("x") is False  # falls back to the browser clipboard in the app

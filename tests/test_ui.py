@@ -273,15 +273,24 @@ async def test_optimal_plan_says_so(app_db):
 
 
 
-async def test_start_a_claude_chat_copies_the_activation_message(app_db):
+async def test_start_a_claude_chat_copies_the_activation_message(app_db, monkeypatch):
+    """Regression: the web view's clipboard did nothing in the native window; copying now
+    goes through the system clipboard."""
+    from schedule_optimizer import clipboard
+
+    copied = []
+    monkeypatch.setattr(clipboard, "copy", lambda text: copied.append(text) or True)
     finish_setup()
     async with user_simulation(root=ui_app.root) as user:
         await user.open("/")
         user.find("Preferences").click()
         user.find(marker="start-claude-chat").click()
         await user.should_see("ACTIVATE SCHEDULE OPTIMIZER FOR THIS CHAT")
+        await user.should_see("It's on your clipboard")
+        user.find(marker="copy-activation").click()
     with db.session() as s:
-        assert len(store.active_chat_codes(s)) == 1
+        [row] = store.active_chat_codes(s)
+    assert copied == [store.activation_message(row.code)] * 2
 
 
 

@@ -15,7 +15,7 @@ from pathlib import Path
 
 from nicegui import run, ui
 
-from . import changes, claude_api, claude_tools, db, desktop_setup, google_auth, optimizer_cal, store
+from . import changes, claude_api, claude_tools, clipboard, db, desktop_setup, google_auth, optimizer_cal, store
 from .calendar_sync import CalendarsNotChosen, busy_events, busy_events_if_connected, connect
 from .domain import EventInput, Plan, TimeOfDay
 from .gcal import list_calendars
@@ -893,14 +893,29 @@ def start_claude_chat() -> None:
     with db.session() as s:
         row = store.new_chat_code(s)
     message = store.activation_message(row.code)
-    ui.clipboard.write(message)
+
+    def copy_message() -> bool:
+        if clipboard.copy(message):
+            return True
+        ui.clipboard.write(message)  # no system clipboard tool: try the browser's (works in a browser tab)
+        return False
+
+    copied = copy_message()
     with ui.dialog() as dialog, ui.card().classes("w-[34rem]"):
         ui.label("Paste this as the first message of a new Claude Desktop chat").classes("text-lg font-medium")
-        ui.code(message).classes("w-full").mark("activation-message")
-        ui.label(f"It's on your clipboard. Then ask, for example, “Plan my afternoon.” Only that chat can use "
-                 f"Schedule Optimizer, for {store.CHAT_CODE_HOURS} hours or until you end Claude chats in "
-                 "Preferences.").classes("text-sm text-gray-500")
+        ui.code(message, language="text").classes("w-full").mark("activation-message")
+        ui.label(("It's on your clipboard. " if copied else "Copy it (select the text if Copy doesn't work). ")
+                 + f"Then ask, for example, “Plan my afternoon.” Only that chat can use Schedule Optimizer, for "
+                 f"{store.CHAT_CODE_HOURS} hours or until you end Claude chats in Preferences.") \
+            .classes("text-sm text-gray-500")
         with ui.row().classes("w-full justify-end"):
+            def copy_again() -> None:
+                if copy_message():
+                    ui.notify("Copied.", type="positive")
+                else:
+                    ui.notify("Couldn't copy automatically; select the text and copy it.", type="warning")
+
+            ui.button("Copy again", icon="content_copy", on_click=copy_again).props("flat").mark("copy-activation")
             ui.button("Done", on_click=dialog.close)
     dialog.open()
     nl_input_view.refresh()

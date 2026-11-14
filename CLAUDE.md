@@ -19,7 +19,8 @@ A local desktop app that reads Google Calendar, takes tasks with weights, and us
 - Re-planning ("what now?") adds a small penalty for moving blocks, so the plan doesn't reshuffle after every progress log.
 - The app writes only to its own "Optimizer" Google calendar, never to real ones.
 - Claude never places blocks. It changes solver inputs, I approve, CP-SAT re-plans.
-- Claude has three modes: off (default, offline), Claude Desktop, and API key.
+- Claude is optional ("Natural Language Input" in Preferences, no mode dropdown): an API key enables the in-app Claude tab (always shown, disabled with a note without a key or connection), and Claude Desktop is set up separately. Without either the app is 100% functional, offline too.
+- Completed tasks are deleted 7 days after they're marked done.
 - Plan blocks are written to the Optimizer calendar only after I click "Approve plan."
 - Preferences (awake window 8:00–23:00, 6 h max focus/day, 5-min buffer, 7-day horizon) have defaults but are editable in a first-run setup step and in Preferences.
 - Event title rules (e.g., "Lecture" → skippable, cost 4) have no built-in defaults. I create them by manual entry or through Claude.
@@ -33,8 +34,8 @@ A local desktop app that reads Google Calendar, takes tasks with weights, and us
 
 - A separate entry point, `mcp_server.py`, built with the MCP Python SDK. It imports the same core modules and uses the same SQLite file (WAL mode on).
 - Tools: `get_plan`, `get_tasks`, `create_task`, `propose_changes`, `apply_changes`, `solve`, `explain_block`.
-- Fully optional: with Claude mode Off (default) the helper lists no tools and refuses calls. Even when on, it works only in chats I activate: "Start a Claude chat" in the app copies "ACTIVATE SCHEDULE OPTIMIZER FOR THIS CHAT (code XXX-XXX)", and every tool call needs an active code (12 h, revocable). Claude Desktop can't start a connector switched off per chat, so this is enforced on our side.
-- During development, register it in Claude Desktop's config (Settings › Developer › Edit Config) with `uv run`, then fully quit and reopen.
+- Fully optional: it works only in chats I activate: "Start a Claude chat" in the app copies "ACTIVATE SCHEDULE OPTIMIZER FOR THIS CHAT (code XXX-XXX)", and every tool call needs an active code (12 h, revocable). Claude Desktop can't start a connector switched off per chat, so this is enforced on our side.
+- During development, "Add it for me" in Preferences adds a `uv run` entry to Claude Desktop's config (backing up the original so Undo restores it exactly); manual steps are in a collapsed section. Then fully quit and reopen Claude Desktop.
 - For release, build the helper as a standalone binary with PyInstaller and pack it with the mcpb CLI. Ship the `.mcpb` inside the app; a "Connect to Claude" button opens it so Claude Desktop shows its install window.
 
 ## Gotchas found so far

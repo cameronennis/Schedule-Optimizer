@@ -8,7 +8,7 @@ from nicegui import ui
 from nicegui.testing.user_simulation import user_simulation
 
 from schedule_optimizer import changes, claude_api, db, google_auth, store, ui_app
-from schedule_optimizer.tables import ClaudeMode, Task
+from schedule_optimizer.tables import Task
 
 
 @pytest.fixture
@@ -17,6 +17,9 @@ def app_db(tmp_path, monkeypatch):
     monkeypatch.setattr(db, "_engine", None)
     monkeypatch.setattr(google_auth, "is_signed_in", lambda: False)  # offline: never touch Google
     monkeypatch.setenv("SCHEDULE_OPTIMIZER_OFFLINE", "1")
+    monkeypatch.setenv("SCHEDULE_OPTIMIZER_CLAUDE_CONFIG", str(tmp_path / "claude_desktop_config.json"))
+    monkeypatch.setattr(claude_api, "has_key", lambda: False)  # never read the real keychain
+    monkeypatch.setattr(claude_api, "reachable", lambda timeout=2.0: True)
     ui_app.STATE.update(plan=None, events=[], error=None, solved_at=None)
     ui_app.CHAT.__init__()
     ui_app.STATE.pop("tab", None)
@@ -184,21 +187,44 @@ async def test_proposal_can_be_applied_from_the_now_tab(app_db):
         assert changes.pending(s) == []
 
 
-async def test_desktop_mode_shows_config_snippet(app_db):
+async def test_natural_language_input_section(app_db):
     finish_setup()
-    with db.session() as s:
-        store.update_prefs(s, claude_mode=ClaudeMode.DESKTOP)
     async with user_simulation(root=ui_app.root) as user:
         await user.open("/")
         user.find("Preferences").click()
-        await user.should_see("Settings › Developer › Edit Config", retries=50)
+        await user.should_see("Natural Language Input")
+        await user.should_see("100% functional, offline too")
+        await user.should_see(marker="api-key")
+        await user.should_see(marker="desktop-add")
+        user.find(marker="desktop-add").click()
+        await user.should_see(marker="desktop-added", retries=50)  # waiting for the Claude Desktop restart
+        await user.should_see(marker="desktop-undo")
+        assert ui_app.STATE["tab"] == "Preferences"  # no jump to another tab
     assert ui_app.desktop_config()["mcpServers"]["schedule-optimizer"]["args"][-1] == "schedule-optimizer-mcp"
 
 
-async def test_api_mode_chat_tab(app_db, monkeypatch):
+async def test_claude_tab_is_always_there_but_disabled_without_a_key(app_db):
     finish_setup()
-    with db.session() as s:
-        store.update_prefs(s, claude_mode=ClaudeMode.API_KEY)
+    async with user_simulation(root=ui_app.root) as user:
+        await user.open("/")
+        user.find("Claude").click()
+        await user.should_see("Add an API key in Preferences › Natural Language Input")
+        [box] = user.find(marker="chat-input").elements
+        assert not box.enabled
+
+
+async def test_claude_tab_says_when_offline(app_db, monkeypatch):
+    finish_setup()
+    monkeypatch.setattr(claude_api, "has_key", lambda: True)
+    monkeypatch.setattr(claude_api, "reachable", lambda timeout=2.0: False)
+    async with user_simulation(root=ui_app.root) as user:
+        await user.open("/")
+        user.find("Claude").click()
+        await user.should_see("You're offline", retries=100)
+
+
+async def test_api_key_chat_tab(app_db, monkeypatch):
+    finish_setup()
     monkeypatch.setattr(claude_api, "has_key", lambda: True)
 
     def fake_send(text):
@@ -249,8 +275,6 @@ async def test_optimal_plan_says_so(app_db):
 
 async def test_start_a_claude_chat_copies_the_activation_message(app_db):
     finish_setup()
-    with db.session() as s:
-        store.update_prefs(s, claude_mode=ClaudeMode.DESKTOP)
     async with user_simulation(root=ui_app.root) as user:
         await user.open("/")
         user.find("Preferences").click()
@@ -261,15 +285,16 @@ async def test_start_a_claude_chat_copies_the_activation_message(app_db):
 
 
 
-async def test_changing_claude_mode_stays_on_preferences(app_db, monkeypatch):
-    """Regression: choosing API key mode jumped to the Now tab before you could paste the key."""
+async def test_saving_an_api_key_stays_on_preferences(app_db, monkeypatch):
+    """Regression: changing Claude settings jumped to the Now tab."""
     finish_setup()
-    monkeypatch.setattr(claude_api, "has_key", lambda: False)  # never read the real keychain
+    saved = {"key": False}
+    monkeypatch.setattr(claude_api, "has_key", lambda: saved["key"])
+    monkeypatch.setattr(claude_api, "save_key", lambda k: saved.update(key=True))
     async with user_simulation(root=ui_app.root) as user:
         await user.open("/")
         user.find("Preferences").click()
-        [mode] = user.find(marker="claude-mode").elements
-        mode.set_value(ClaudeMode.API_KEY.value)
-        await user.should_see(marker="api-key")  # the key field, on the Preferences tab
+        user.find(marker="api-key").type("sk-ant-test")
+        user.find(marker="api-key-save").click()
+        await user.should_see(marker="api-key-remove", retries=100)
         assert ui_app.STATE["tab"] == "Preferences"
-        await user.should_see("Claude")  # the new Claude tab appeared too

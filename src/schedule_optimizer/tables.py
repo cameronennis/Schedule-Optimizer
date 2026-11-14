@@ -82,6 +82,7 @@ class Task(SQLModel, table=True):
     status: TaskStatus = TaskStatus.ACTIVE
     notes: str = ""
     created_at: datetime = _dt(default_factory=utcnow)
+    completed_at: datetime | None = _dt(default=None)  # when marked done; done tasks are deleted 7 days later (v6)
 
 
 class EventMeta(SQLModel, table=True):
@@ -117,7 +118,6 @@ class Preferences(SQLModel, table=True):
     horizon_days: int = 7
     time_zone: str | None = None  # IANA name; None = this computer's zone
     busy_calendars: list[str] = Field(default_factory=list, sa_column=Column(JSON))
-    claude_mode: ClaudeMode = ClaudeMode.OFF
     setup_complete: bool = False
     # Objective weights, in points (see domain.Preferences).
     chunk_cost: float = 1.0
@@ -125,7 +125,9 @@ class Preferences(SQLModel, table=True):
     time_of_day_bonus_per_hour: float = 1.0
     stability_per_hour: float = 1.0  # added in schema v2
     optimizer_calendar_id: str | None = None  # the app's own Google calendar (schema v2)
-    claude_monthly_cap_usd: float = 5.0  # API-key mode spending cap (schema v3)
+    claude_monthly_cap_usd: float = 5.0  # API-key spending cap (schema v3)
+    claude_mode: ClaudeMode = ClaudeMode.OFF  # unused since schema v6 (kept so older files still open)
+    desktop_helper_seen_at: datetime | None = _dt(default=None)  # last time Claude Desktop started the helper (v6)
 
 
 class ProgressLog(SQLModel, table=True):

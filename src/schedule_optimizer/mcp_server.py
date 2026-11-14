@@ -4,11 +4,10 @@ Claude Desktop starts this program and talks to it through stdin/stdout. It uses
 the same database file as the app window (WAL mode lets both write), so the
 window doesn't need to be open. Tools are defined once in claude_tools.
 
-It's optional and off by default: unless the app's Claude mode is "Claude
-Desktop", it offers no tools and refuses every call, so installing it changes
-nothing until you turn it on. Even then it works only in chats you activate:
-"Start a Claude chat" in the app copies "ACTIVATE SCHEDULE OPTIMIZER FOR THIS CHAT
-(code …)", and every call must carry an active code (12 hours, revocable).
+It's optional, and it works only in chats you activate: "Start a Claude chat"
+in the app copies "ACTIVATE SCHEDULE OPTIMIZER FOR THIS CHAT (code …)", and every
+call must carry an active code (12 hours, revocable). Without one, every call is
+refused, so an installed helper does nothing in other chats.
 
 During development, register it in Claude Desktop's config with `uv run`
 (see README), then fully quit and reopen Claude Desktop. Releases install it
@@ -19,7 +18,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 
 import anyio
 import mcp_types as types
@@ -27,7 +26,6 @@ from mcp.server.lowlevel import Server
 from mcp.server.stdio import stdio_server
 
 from . import claude_tools, db, store
-from .tables import ClaudeMode
 
 ACTIVATION = f"""\
 IMPORTANT: Use these tools only in a chat where the user has pasted
@@ -69,14 +67,10 @@ def _tool(name: str, spec: dict) -> types.Tool:
     )
 
 
-OFF_MESSAGE = ("Claude Desktop is turned off in Schedule Optimizer. To use it, open the app and choose "
-               "Preferences › Claude › Claude Desktop.")
-
-
-def _enabled() -> bool:
-    """The helper does nothing unless the app's Claude mode is Claude Desktop."""
+def _seen() -> None:
+    """Note that Claude Desktop started the helper, so the app can show "Connected"."""
     with db.session() as s:
-        return store.get_prefs(s).claude_mode == ClaudeMode.DESKTOP
+        store.update_prefs(s, desktop_helper_seen_at=datetime.now(timezone.utc))
 
 
 NOT_ACTIVE_MESSAGE = (
@@ -99,15 +93,14 @@ def _call(name: str, args: dict) -> dict:
 
 
 async def list_tools(ctx, params) -> types.ListToolsResult:
-    # Off: offer no tools at all, so nothing in an unrelated chat can trigger them.
-    if not await anyio.to_thread.run_sync(_enabled):
-        return types.ListToolsResult(tools=[])
+    try:
+        await anyio.to_thread.run_sync(_seen)
+    except Exception:  # noqa: BLE001: a busy database shouldn't stop the tool list
+        log.warning("couldn't record the connection time", exc_info=True)
     return types.ListToolsResult(tools=[_tool(n, spec) for n, spec in claude_tools.TOOLS.items()])
 
 
 async def call_tool(ctx, params: types.CallToolRequestParams) -> types.CallToolResult:
-    if not await anyio.to_thread.run_sync(_enabled):  # turned off after Claude Desktop listed the tools
-        return types.CallToolResult(content=[types.TextContent(type="text", text=OFF_MESSAGE)], is_error=True)
     try:
         result = await anyio.to_thread.run_sync(_call, params.name, params.arguments or {})
     except NotActive as e:

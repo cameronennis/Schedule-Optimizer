@@ -60,6 +60,17 @@ def has_key() -> bool:
     return bool(get_key())
 
 
+def reachable(timeout: float = 2.0) -> bool:
+    """Is the Claude API reachable from here (a quick connection test, nothing sent)?"""
+    import socket
+
+    try:
+        socket.create_connection(("api.anthropic.com", 443), timeout=timeout).close()
+        return True
+    except OSError:
+        return False
+
+
 def check_key(key: str) -> None:
     """A free test call (looks up the model). Raises anthropic errors if the key is bad."""
     anthropic.Anthropic(api_key=key, max_retries=1, timeout=20.0).models.retrieve(MODEL)

@@ -13,7 +13,7 @@ from schedule_optimizer.demo import NOW, at
 from schedule_optimizer.diagnose import diagnose
 from schedule_optimizer.domain import EventInput, Preferences, TaskInput
 from schedule_optimizer.solver import solve
-from schedule_optimizer.tables import ClaudeMode, Proposal, ProposalStatus
+from schedule_optimizer.tables import Proposal, ProposalStatus
 
 CTX = claude_tools.Ctx(source="test", now=lambda: NOW)
 
@@ -165,7 +165,7 @@ async def test_mcp_server_lists_and_runs_tools(tmp_path):
 
     eng = db.make_engine(tmp_path / "schedule.db")
     with Session(eng) as s:
-        store.update_prefs(s, time_zone="America/Los_Angeles", claude_mode=ClaudeMode.DESKTOP)
+        store.update_prefs(s, time_zone="America/Los_Angeles")
         store.add_task(s, title="Essay", total_minutes=120)
         code = store.new_chat_code(s).code
     eng.dispose()
@@ -252,9 +252,10 @@ def test_solve_tool_reports_optimality_and_accepts_a_longer_limit(s):
 
 
 
-async def test_mcp_server_does_nothing_unless_turned_on(tmp_path):
-    """Claude is optional: with Claude mode Off (the default), an installed helper offers
-    no tools and refuses calls, so nothing in an unrelated chat can use it."""
+async def test_installed_helper_does_nothing_without_a_chat_code(tmp_path):
+    """Claude is optional: an installed helper refuses every call unless the chat carries an
+    active code, so nothing in an unrelated chat can use it. Listing tools records that
+    Claude Desktop connected."""
     from mcp.client.session import ClientSession
     from mcp.client.stdio import StdioServerParameters, stdio_client
 
@@ -262,38 +263,30 @@ async def test_mcp_server_does_nothing_unless_turned_on(tmp_path):
     with Session(eng) as s:
         store.update_prefs(s, time_zone="America/Los_Angeles")
         store.add_task(s, title="Essay", total_minutes=120)
-        assert store.get_prefs(s).claude_mode == ClaudeMode.OFF  # the default
     params = StdioServerParameters(
         command=sys.executable, args=["-m", "schedule_optimizer.mcp_server"],
         env={**os.environ, "SCHEDULE_OPTIMIZER_DATA_DIR": str(tmp_path), "SCHEDULE_OPTIMIZER_OFFLINE": "1"},
     )
     async with stdio_client(params) as (read, write), ClientSession(read, write) as session:
         await session.initialize()
-        assert (await session.list_tools()).tools == []
+        assert len((await session.list_tools()).tools) == 7
+        with Session(eng) as s:
+            assert store.get_prefs(s).desktop_helper_seen_at is not None
         result = await session.call_tool("solve", {})
-        assert result.is_error and "turned off" in result.content[0].text
+        assert result.is_error and "isn't active in this chat" in result.content[0].text
         with Session(eng) as s:
             assert store.last_solve(s) is None  # nothing ran
-
-        with Session(eng) as s:  # turning it on works without restarting the helper
-            store.update_prefs(s, claude_mode=ClaudeMode.DESKTOP)
-            code = store.new_chat_code(s).code
-        assert len((await session.list_tools()).tools) == 7
-        with Session(eng) as s:  # and turning it off again blocks calls right away
-            store.update_prefs(s, claude_mode=ClaudeMode.OFF)
-        assert (await session.call_tool("get_plan", {"chat_code": code})).is_error
     eng.dispose()
 
 
-
 async def test_mcp_server_works_only_in_an_activated_chat(tmp_path):
-    """A chat without the pasted code can't use the tools, even with Claude Desktop mode on."""
+    """A chat without the pasted code can't use the tools."""
     from mcp.client.session import ClientSession
     from mcp.client.stdio import StdioServerParameters, stdio_client
 
     eng = db.make_engine(tmp_path / "schedule.db")
     with Session(eng) as s:
-        store.update_prefs(s, time_zone="America/Los_Angeles", claude_mode=ClaudeMode.DESKTOP)
+        store.update_prefs(s, time_zone="America/Los_Angeles")
         code = store.new_chat_code(s).code
     params = StdioServerParameters(
         command=sys.executable, args=["-m", "schedule_optimizer.mcp_server"],
@@ -319,3 +312,78 @@ def test_chat_codes_expire(s):
     assert store.activation_message(row.code) == f"ACTIVATE SCHEDULE OPTIMIZER FOR THIS CHAT (code {row.code})"
     assert store.chat_code_is_active(s, row.code, now=NOW + timedelta(hours=11))
     assert not store.chat_code_is_active(s, row.code, now=NOW + timedelta(hours=13))
+
+
+
+# ---- Claude Desktop config: "Add it for me" with a saved copy -------------------------------
+
+from schedule_optimizer import desktop_setup  # noqa: E402
+
+
+@pytest.fixture
+def claude_config(tmp_path, monkeypatch):
+    monkeypatch.setenv("SCHEDULE_OPTIMIZER_DATA_DIR", str(tmp_path / "data"))
+    path = tmp_path / "Claude" / "claude_desktop_config.json"
+    monkeypatch.setenv("SCHEDULE_OPTIMIZER_CLAUDE_CONFIG", str(path))
+    return path
+
+
+def test_add_keeps_other_settings_and_undo_restores_exactly(claude_config):
+    claude_config.parent.mkdir(parents=True)
+    original = '{\n  "mcpServers": {"weather": {"command": "w"}},\n  "theme": "dark"\n}\n'
+    claude_config.write_text(original)
+    desktop_setup.add_entry()
+    data = json.loads(claude_config.read_text())
+    assert data["theme"] == "dark" and "weather" in data["mcpServers"]
+    assert data["mcpServers"]["schedule-optimizer"]["args"][-1] == "schedule-optimizer-mcp"
+    assert desktop_setup.is_configured() and desktop_setup.has_backup()
+    desktop_setup.undo()
+    assert claude_config.read_text() == original  # byte for byte
+    assert not desktop_setup.is_configured() and not desktop_setup.has_backup()
+
+
+def test_add_creates_a_missing_file_and_undo_removes_it(claude_config):
+    desktop_setup.add_entry()
+    assert desktop_setup.is_configured()
+    desktop_setup.undo()
+    assert not claude_config.exists()
+
+
+def test_add_refuses_a_broken_file_without_changing_it(claude_config):
+    claude_config.parent.mkdir(parents=True)
+    claude_config.write_text('{"mcpServers": {')
+    with pytest.raises(desktop_setup.ConfigError, match="isn't valid JSON"):
+        desktop_setup.add_entry()
+    assert claude_config.read_text() == '{"mcpServers": {'
+    assert not desktop_setup.has_backup()
+
+
+def test_manual_snippets_are_valid_json(claude_config):
+    whole = json.loads(desktop_setup.snippet())
+    entry = json.loads("{" + desktop_setup.entry_snippet() + "}")
+    assert whole["mcpServers"] == entry
+
+
+# ---- done tasks are deleted after 7 days ---------------------------------------------------
+
+def test_done_tasks_are_deleted_after_seven_days(s):
+    from datetime import datetime, timezone
+
+    keep = store.add_task(s, title="Recent", total_minutes=60)
+    old = store.add_task(s, title="Old", total_minutes=60)
+    active = store.add_task(s, title="Active", total_minutes=60)
+    store.log_progress(s, old.id, 30, NOW)
+    for t in (keep, old):
+        store.update_task(s, t.id, status="done")
+    assert s.get(type(old), old.id).completed_at is not None
+    now = datetime.now(timezone.utc)
+    old.completed_at = now - timedelta(days=8)
+    s.add(old)
+    s.commit()
+    assert store.purge_done_tasks(s, now) == 1
+    titles = {t.title for t in store.list_tasks(s, include_done=True)}
+    assert titles == {"Recent", "Active"}
+    assert store.logged_minutes(s, old.id) == 0  # its progress went with it
+
+    store.update_task(s, keep.id, status="active")  # reopening clears the completion time
+    assert s.get(type(keep), keep.id).completed_at is None

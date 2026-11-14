@@ -9,18 +9,17 @@ the window stays responsive.
 
 from __future__ import annotations
 
-import json
-import shutil
+import sys
 from datetime import datetime, time, timedelta
 from pathlib import Path
 
 from nicegui import run, ui
 
-from . import changes, claude_api, claude_tools, db, google_auth, optimizer_cal, store
+from . import changes, claude_api, claude_tools, db, desktop_setup, google_auth, optimizer_cal, store
 from .calendar_sync import CalendarsNotChosen, busy_events, busy_events_if_connected, connect
 from .domain import EventInput, Plan, TimeOfDay
 from .gcal import list_calendars
-from .tables import ClaudeMode, EffortMode, Task, TaskStatus
+from .tables import EffortMode, Task, TaskStatus
 
 # Single-user desktop app: small in-memory UI state. The plan itself lives in the database
 # (PlanBlock and LastSolve), so solves from the Claude Desktop helper show up here too.
@@ -234,11 +233,6 @@ async def _calendar_picker() -> None:
 # ---- Now -------------------------------------------------------------------------------
 
 
-def _claude_mode() -> ClaudeMode:
-    with db.session() as s:
-        return store.get_prefs(s).claude_mode
-
-
 def _use_google() -> bool:
     if not google_auth.is_signed_in():
         return False
@@ -356,7 +350,7 @@ def now_view() -> None:
             .props("" if can_approve or holds else "disable") \
             .tooltip("Saves this plan and writes it, with any breaks, to your Optimizer calendar")
         ui.button("Log progress", icon="timer", on_click=lambda: open_log_dialog()).props("outline").mark("log")
-        if _claude_mode() == ClaudeMode.DESKTOP:
+        if desktop_setup.is_configured():
             ui.button("Start a Claude chat", icon="chat", on_click=start_claude_chat).props("outline")
         ui.label("Using Google Calendar" if _use_google() else "Offline: Google Calendar not used") \
             .classes("text-sm text-gray-500 ml-2")
@@ -525,7 +519,7 @@ def refresh_all() -> None:
     chat_view.refresh()
 
 
-# ---- Claude chat (API-key mode) ----------------------------------------------------------
+# ---- Claude tab ------------------------------------------------------------------------
 
 
 def _send_chat(text: str) -> None:
@@ -538,9 +532,12 @@ def _send_chat(text: str) -> None:
 
 @ui.refreshable
 def chat_view() -> None:
-    if not claude_api.has_key():
-        ui.label("Add your Claude API key in Preferences to chat here.").classes("text-gray-500")
-        return
+    has_key = claude_api.has_key()
+    ui.label("Chat with Claude").classes("text-lg font-medium")
+    note = ui.label("").classes("text-sm text-gray-500").mark("chat-note")
+    if not has_key:
+        note.text = ("Add an API key in Preferences › Natural Language Input to chat here. "
+                     "Everything else works without it.")
     with ui.column().classes("w-full gap-2"):
         for role, text in CHAT.log:
             if role == "user":
@@ -564,6 +561,9 @@ def chat_view() -> None:
             text = (box.value or "").strip()
             if not text:
                 return
+            if not await run.io_bound(claude_api.reachable):
+                note.text = "You're offline, so Claude can't answer right now. Everything else still works."
+                return
             box.value = ""
             n = ui.notification("Claude is thinking…", spinner=True, timeout=None)
             try:
@@ -575,15 +575,35 @@ def chat_view() -> None:
             n.dismiss()
             refresh_all()
 
-        ui.button(icon="send", on_click=send).props("round").mark("chat-send")
+        send_btn = ui.button(icon="send", on_click=send).props("round").mark("chat-send")
+    if not has_key:
+        box.disable()
+        send_btn.disable()
+    else:
+        async def check_online() -> None:
+            if not await run.io_bound(claude_api.reachable):
+                note.text = "You're offline, so Claude can't answer right now. Everything else still works."
+                box.disable()
+                send_btn.disable()
 
-    def new_chat() -> None:
-        CHAT.messages.clear()
-        CHAT.log.clear()
-        CHAT.proposals.clear()
-        chat_view.refresh()
+        ui.timer(0, check_online, once=True)
 
-    ui.button("New chat", icon="refresh", on_click=new_chat).props("flat dense")
+        def new_chat() -> None:
+            CHAT.messages.clear()
+            CHAT.log.clear()
+            CHAT.proposals.clear()
+            chat_view.refresh()
+
+        ui.button("New chat", icon="refresh", on_click=new_chat).props("flat dense")
+
+    ui.separator().classes("my-4")
+    ui.label("Claude Desktop").classes("text-lg font-medium")
+    if desktop_setup.is_configured():
+        ui.label("Start a chat in Claude Desktop that can use Schedule Optimizer.").classes("text-sm text-gray-500")
+        ui.button("Start a Claude chat", icon="chat", on_click=start_claude_chat).mark("chat-tab-start")
+    else:
+        ui.label("Set up Claude Desktop in Preferences › Natural Language Input to use it with your Claude plan.") \
+            .classes("text-sm text-gray-500")
 
 
 # ---- Tasks -----------------------------------------------------------------------------
@@ -862,8 +882,10 @@ def prefs_view() -> None:
     ui.label("Calendars that block time").classes("font-medium mt-2")
     calendar_picker()
     ui.separator().classes("my-4")
-    ui.label("Claude").classes("text-lg font-medium")
-    claude_prefs()
+    ui.label("Natural Language Input").classes("text-lg font-medium")
+    ui.label("Optional: plan by chatting with Claude. Without an API key or Claude Desktop, Schedule Optimizer is "
+             "100% functional, offline too.").classes("text-sm text-gray-500")
+    nl_input_view()
 
 
 def start_claude_chat() -> None:
@@ -872,114 +894,161 @@ def start_claude_chat() -> None:
         row = store.new_chat_code(s)
     message = store.activation_message(row.code)
     ui.clipboard.write(message)
-    with ui.dialog() as dialog, ui.card().classes("w-[32rem]"):
-        ui.label("Paste this into the Claude Desktop chat you want to use").classes("text-lg font-medium")
+    with ui.dialog() as dialog, ui.card().classes("w-[34rem]"):
+        ui.label("Paste this as the first message of a new Claude Desktop chat").classes("text-lg font-medium")
         ui.code(message).classes("w-full").mark("activation-message")
-        ui.label(f"It's copied to your clipboard. Only that chat can use Schedule Optimizer, for "
-                 f"{store.CHAT_CODE_HOURS} hours or until you end Claude chats in Preferences.") \
-            .classes("text-sm text-gray-500")
+        ui.label(f"It's on your clipboard. Then ask, for example, “Plan my afternoon.” Only that chat can use "
+                 f"Schedule Optimizer, for {store.CHAT_CODE_HOURS} hours or until you end Claude chats in "
+                 "Preferences.").classes("text-sm text-gray-500")
         with ui.row().classes("w-full justify-end"):
             ui.button("Done", on_click=dialog.close)
     dialog.open()
+    nl_input_view.refresh()
 
 
 def desktop_config() -> dict:
     """The Claude Desktop config entry for running the helper from this checkout (development)."""
-    project = Path(__file__).resolve().parents[2]
-    uv = shutil.which("uv") or "uv"
-    return {"mcpServers": {"schedule-optimizer": {
-        "command": uv, "args": ["run", "--directory", str(project), "schedule-optimizer-mcp"]}}}
+    return {"mcpServers": {desktop_setup.SERVER_NAME: desktop_setup.server_entry()}}
 
 
-def claude_prefs() -> None:
+def _quit_hint() -> str:
+    return "press ⌘Q in Claude Desktop" if sys.platform == "darwin" else "quit it from its menu or tray icon"
+
+
+@ui.refreshable
+def nl_input_view() -> None:
     with db.session() as s:
         prefs = store.get_prefs(s)
         spent = claude_api.month_usage(s).cost_usd
+        active = len(store.active_chat_codes(s))
+    zone = store.local_tz(prefs)
 
-    def set_mode(e) -> None:
-        with db.session() as s:
-            store.update_prefs(s, claude_mode=ClaudeMode(e.value))
-        root_view.refresh()
+    def redraw() -> None:
+        nl_input_view.refresh()
+        chat_view.refresh()
 
-    ui.label("Claude never places blocks. It suggests changes to tasks, events and preferences; "
-             "you apply them, and the solver re-plans.").classes("text-sm text-gray-500")
-    ui.select({ClaudeMode.OFF.value: "Off (works offline)",
-               ClaudeMode.DESKTOP.value: "Claude Desktop (uses your Claude plan)",
-               ClaudeMode.API_KEY.value: "API key (chat in this window, billed per use)"},
-              label="Claude mode", value=prefs.claude_mode.value, on_change=set_mode).classes("w-96") \
-        .mark("claude-mode")
-
-    if prefs.claude_mode == ClaudeMode.DESKTOP:
-        ui.label("Claude Desktop works only in chats you activate: click “Start a Claude chat” and paste the "
-                 "message into that chat. Claude asks you before each change. Choose Off to stop it entirely.") \
-            .classes("text-sm mt-2")
-        with db.session() as s:
-            active = len(store.active_chat_codes(s))
+    # -- API key --
+    ui.label("Claude API key").classes("font-medium mt-2")
+    ui.label("Chat in the Claude tab, billed per use to your Claude Console account.").classes("text-sm text-gray-500")
+    if claude_api.has_key():
         with ui.row().classes("items-center gap-3"):
-            ui.button("Start a Claude chat", icon="chat", on_click=start_claude_chat).mark("start-claude-chat")
-            if active:
-                def end_all() -> None:
-                    with db.session() as s:
-                        n = store.revoke_chat_codes(s)
-                    ui.notify(f"Ended {n} Claude chat{'s' if n != 1 else ''}.")
-                    root_view.refresh()
+            ui.label("Key saved in your system keychain.").classes("text-sm")
 
-                ui.label(f"{active} active chat{'s' if active != 1 else ''}").classes("text-sm text-gray-500")
-                ui.button("End all Claude chats", on_click=end_all).props("flat dense").mark("end-claude-chats")
-        ui.label("Developer setup (a one-click “Connect to Claude” button replaces this in the release): add "
-                 "this to Claude Desktop's config (Settings › Developer › Edit Config), then fully quit and reopen "
-                 "Claude Desktop.").classes("text-sm text-gray-500 mt-2")
-        snippet = json.dumps(desktop_config(), indent=2)
-        ui.code(snippet, language="json").classes("w-full")
-        ui.label("If the file already has an \"mcpServers\" section, add just the \"schedule-optimizer\" entry "
-                 "inside it.").classes("text-sm text-gray-500")
+            def forget() -> None:
+                claude_api.forget_key()
+                ui.notify("Key removed.")
+                redraw()
 
-    if prefs.claude_mode == ClaudeMode.API_KEY:
-        if claude_api.has_key():
-            with ui.row().classes("items-center gap-3 mt-2"):
-                ui.label("API key saved in your system keychain.").classes("text-sm")
+            ui.button("Remove key", icon="key_off", on_click=forget).props("outline dense").mark("api-key-remove")
+    else:
+        ui.label("Create a key at platform.claude.com, then paste it here. It's stored in your system keychain, "
+                 "not in the app's files.").classes("text-sm")
+        with ui.row().classes("items-end gap-2"):
+            key = ui.input("API key", password=True, password_toggle_button=True).classes("w-96").mark("api-key")
 
-                def forget() -> None:
-                    claude_api.forget_key()
-                    ui.notify("Key removed.")
-                    root_view.refresh()
-
-                ui.button("Remove key", icon="key_off", on_click=forget).props("outline dense")
-        else:
-            ui.label("Create a key in the Claude Console (platform.claude.com), then paste it here. "
-                     "It's stored in your system keychain, not in the app's files.").classes("text-sm mt-2")
-            with ui.row().classes("items-end gap-2"):
-                key = ui.input("API key", password=True, password_toggle_button=True).classes("w-96") \
-                    .mark("api-key")
-
-                async def save_key() -> None:
-                    n = ui.notification("Checking the key…", spinner=True, timeout=None)
-                    try:
-                        await run.io_bound(claude_api.save_key, key.value or "")
-                    except Exception as e:  # noqa: BLE001
-                        n.dismiss()
-                        notify_error(ValueError(f"That key didn't work: {e}"))
-                        return
-                    n.dismiss()
-                    ui.notify("Key saved.", type="positive")
-                    root_view.refresh()
-
-                ui.button("Save key", icon="key", on_click=save_key).mark("api-key-save")
-        with ui.row().classes("items-end gap-3"):
-            cap = ui.number("Monthly spending cap", value=prefs.claude_monthly_cap_usd, min=0, step=1,
-                            prefix="$").classes("w-44").mark("api-cap")
-
-            def save_cap() -> None:
+            async def save_key() -> None:
+                n = ui.notification("Checking the key…", spinner=True, timeout=None)
                 try:
-                    with db.session() as s:
-                        store.update_prefs(s, claude_monthly_cap_usd=float(cap.value or 0))
-                except ValueError as e:
-                    notify_error(e)
+                    await run.io_bound(claude_api.save_key, key.value or "")
+                except Exception as e:  # noqa: BLE001
+                    n.dismiss()
+                    notify_error(ValueError(f"That key didn't work: {e}"))
                     return
-                ui.notify("Cap saved.", type="positive")
+                n.dismiss()
+                ui.notify("Key saved. Chat in the Claude tab.", type="positive")
+                redraw()
 
-            ui.button("Save cap", on_click=save_cap).props("flat")
-            ui.label(f"Spent this month: about ${spent:.2f}").classes("text-sm text-gray-500")
+            ui.button("Save key", icon="key", on_click=save_key).mark("api-key-save")
+    with ui.row().classes("items-end gap-3"):
+        cap = ui.number("Monthly spending cap", value=prefs.claude_monthly_cap_usd, min=0, step=1,
+                        prefix="$").classes("w-44").mark("api-cap")
+
+        def save_cap() -> None:
+            try:
+                with db.session() as s:
+                    store.update_prefs(s, claude_monthly_cap_usd=float(cap.value or 0))
+            except ValueError as e:
+                notify_error(e)
+                return
+            ui.notify("Cap saved.", type="positive")
+
+        ui.button("Save cap", on_click=save_cap).props("flat")
+        ui.label(f"Spent this month: about ${spent:.2f}").classes("text-sm text-gray-500")
+
+    # -- Claude Desktop --
+    ui.label("Claude Desktop").classes("font-medium mt-6")
+    ui.label("Use your Claude plan from Claude Desktop. It only works in chats you activate, and Claude asks "
+             "before each change.").classes("text-sm text-gray-500")
+    configured = desktop_setup.is_configured()
+    seen = prefs.desktop_helper_seen_at
+
+    ui.label("1. Connect Claude Desktop").classes("text-sm font-medium mt-2")
+    with ui.row().classes("items-center gap-3"):
+        if configured and seen:
+            ui.icon("check_circle", color="positive")
+            ui.label(f"Connected (Claude Desktop last started it {seen.astimezone(zone):%a %H:%M}).") \
+                .classes("text-sm").mark("desktop-connected")
+        elif configured:
+            ui.icon("schedule", color="warning")
+            ui.label(f"Added. To finish, fully quit Claude Desktop ({_quit_hint()}) and reopen it.") \
+                .classes("text-sm").mark("desktop-added")
+        else:
+            async def add_for_me() -> None:
+                try:
+                    path = await run.io_bound(desktop_setup.add_entry)
+                except (desktop_setup.ConfigError, OSError) as e:
+                    notify_error(ValueError(str(e)))
+                    return
+                ui.notify(f"Added to {path.name} (a copy of the original was saved, so you can undo).",
+                          type="positive")
+                redraw()
+
+            ui.button("Add it for me", icon="link", on_click=add_for_me).mark("desktop-add")
+            ui.label("Adds Schedule Optimizer to Claude Desktop's config. Your other settings are kept, and a "
+                     "copy of the original is saved first.").classes("text-sm text-gray-500")
+        if desktop_setup.has_backup():
+            def undo() -> None:
+                try:
+                    desktop_setup.undo()
+                except (desktop_setup.ConfigError, OSError) as e:
+                    notify_error(ValueError(str(e)))
+                    return
+                ui.notify("Claude Desktop's config is back to how it was. Restart Claude Desktop to apply.")
+                redraw()
+
+            ui.button("Undo", icon="undo", on_click=undo).props("flat dense").mark("desktop-undo") \
+                .tooltip("Restore Claude Desktop's config file from the saved copy")
+
+    with ui.expansion("Set it up manually instead").classes("w-full text-sm").mark("desktop-manual"):
+        path = desktop_setup.config_path()
+        ui.label("1. Open Claude Desktop's config file (or in Claude Desktop: Settings › Developer › Edit Config):") \
+            .classes("text-sm")
+        with ui.row().classes("items-center gap-2"):
+            ui.code(str(path)).classes("text-xs")
+            ui.button("Open folder", icon="folder_open", on_click=desktop_setup.open_folder).props("flat dense")
+        ui.label("2. If the file is empty or missing, paste this as the whole file:").classes("text-sm mt-2")
+        ui.code(desktop_setup.snippet(), language="json").classes("w-full")
+        ui.label("If it already has an \"mcpServers\" section, paste just this inside its braces (add a comma "
+                 "after the entry before it):").classes("text-sm mt-2")
+        ui.code(desktop_setup.entry_snippet(), language="json").classes("w-full")
+        ui.label(f"3. Save the file, then fully quit Claude Desktop ({_quit_hint()}) and reopen it.") \
+            .classes("text-sm mt-2")
+
+    ui.label("2. Start a chat").classes("text-sm font-medium mt-4")
+    ui.label(f"Click below, then paste the copied message (“{store.ACTIVATION_PHRASE} (code …)”) as the first "
+             f"message of a new Claude Desktop chat. Only that chat can use Schedule Optimizer, for "
+             f"{store.CHAT_CODE_HOURS} hours.").classes("text-sm text-gray-500")
+    with ui.row().classes("items-center gap-3"):
+        ui.button("Start a Claude chat", icon="chat", on_click=start_claude_chat).mark("start-claude-chat")
+        if active:
+            def end_all() -> None:
+                with db.session() as s:
+                    n = store.revoke_chat_codes(s)
+                ui.notify(f"Ended {n} Claude chat{'s' if n != 1 else ''}.")
+                nl_input_view.refresh()
+
+            ui.label(f"{active} active chat{'s' if active != 1 else ''}").classes("text-sm text-gray-500")
+            ui.button("End all Claude chats", on_click=end_all).props("flat dense").mark("end-claude-chats")
 
 
 # ---- First-run setup -------------------------------------------------------------------
@@ -1020,27 +1089,25 @@ def setup_view() -> None:
 def root_view() -> None:
     with db.session() as s:
         store.import_legacy_settings(s)
-        prefs = store.get_prefs(s)
-        done, mode = prefs.setup_complete, prefs.claude_mode
+        store.purge_done_tasks(s)
+        done = store.get_prefs(s).setup_complete
     if not done:
         setup_view()
         return
     # Redraws (e.g. after changing the Claude mode) keep you on the tab you were on.
-    names = ["Now", "Claude", "Tasks", "Events", "Preferences"] if mode == ClaudeMode.API_KEY \
-        else ["Now", "Tasks", "Events", "Preferences"]
+    names = ["Now", "Claude", "Tasks", "Events", "Preferences"]
     current = STATE.get("tab") if STATE.get("tab") in names else "Now"
     with ui.tabs(value=current, on_change=lambda e: STATE.update(tab=e.value)).classes("w-full") as tabs:
         now_tab = ui.tab("Now", icon="today")
-        chat_tab = ui.tab("Claude", icon="chat") if mode == ClaudeMode.API_KEY else None
+        chat_tab = ui.tab("Claude", icon="chat")
         tasks_tab = ui.tab("Tasks", icon="checklist")
         events_tab = ui.tab("Events", icon="event")
         prefs_tab = ui.tab("Preferences", icon="tune")
     with ui.tab_panels(tabs, value=current).classes("w-full"):
         with ui.tab_panel(now_tab):
             now_view()
-        if chat_tab is not None:
-            with ui.tab_panel(chat_tab):
-                chat_view()
+        with ui.tab_panel(chat_tab):
+            chat_view()
         with ui.tab_panel(tasks_tab):
             tasks_view()
         with ui.tab_panel(events_tab):

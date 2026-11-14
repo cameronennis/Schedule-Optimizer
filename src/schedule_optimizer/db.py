@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator
+from datetime import datetime, timezone
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -50,7 +51,16 @@ def _v4_to_v5(conn) -> None:
     tables.ChatCode.__table__.create(conn)
 
 
-MIGRATIONS: list[Callable] = [_v1_to_v2, _v2_to_v3, _v3_to_v4, _v4_to_v5]
+def _v5_to_v6(conn) -> None:
+    """Done tasks get a completion time (they're deleted 7 days later); Claude Desktop connection time."""
+    conn.execute(text("ALTER TABLE task ADD COLUMN completed_at DATETIME"))
+    conn.execute(text("ALTER TABLE preferences ADD COLUMN desktop_helper_seen_at DATETIME"))
+    # Tasks already done start their 7 days now.
+    conn.execute(text("UPDATE task SET completed_at = :now WHERE status = 'DONE'"),
+                 {"now": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")})  # SQLAlchemy's format
+
+
+MIGRATIONS: list[Callable] = [_v1_to_v2, _v2_to_v3, _v3_to_v4, _v4_to_v5, _v5_to_v6]
 SCHEMA_VERSION = 1 + len(MIGRATIONS)
 
 

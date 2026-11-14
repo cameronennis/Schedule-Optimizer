@@ -50,7 +50,7 @@ PREF_FIELDS = {
     "awake_start", "awake_end", "max_focus_minutes_per_day", "buffer_minutes", "horizon_days",
     "time_zone", "busy_calendars", "claude_mode", "setup_complete",
     "chunk_cost", "ideal_deviation_per_hour", "time_of_day_bonus_per_hour", "stability_per_hour",
-    "optimizer_calendar_id", "claude_monthly_cap_usd",
+    "optimizer_calendar_id", "claude_monthly_cap_usd", "desktop_helper_seen_at",
 }
 
 
@@ -143,8 +143,13 @@ def update_task(s: Session, task_id: int, **changes) -> Task:
         if k in ("id", "created_at") or k not in Task.model_fields:
             raise ValueError(f"can't set {k!r}")
     validated = Task.model_validate({**task.model_dump(), **changes})
+    was_done = task.status == TaskStatus.DONE
     for k in changes:
         setattr(task, k, getattr(validated, k))
+    if task.status == TaskStatus.DONE and not was_done:
+        task.completed_at = datetime.now(timezone.utc)
+    elif task.status != TaskStatus.DONE:
+        task.completed_at = None
     _validate_task(task)
     s.add(task)
     s.commit()
@@ -158,6 +163,21 @@ def delete_task(s: Session, task_id: int) -> None:
         raise KeyError(f"no task with id {task_id}")
     s.delete(task)
     s.commit()
+
+
+DONE_KEEP_DAYS = 7
+
+
+def purge_done_tasks(s: Session, now: datetime | None = None) -> int:
+    """Delete tasks marked done more than DONE_KEEP_DAYS ago, with their progress and blocks."""
+    cutoff = (now or datetime.now(timezone.utc)) - timedelta(days=DONE_KEEP_DAYS)
+    old = list(s.exec(select(Task).where(Task.status == TaskStatus.DONE, Task.completed_at != None,  # noqa: E711
+                                         Task.completed_at < cutoff)))
+    for t in old:
+        s.delete(t)
+    if old:
+        s.commit()
+    return len(old)
 
 
 def list_tasks(s: Session, include_done: bool = False) -> list[Task]:
@@ -314,6 +334,7 @@ def plan_now(
     a plan that hit the limit has status FEASIBLE (good, not proven best) instead of OPTIMAL.
     """
     prefs = get_prefs(s)
+    purge_done_tasks(s, now)
     tasks, weekly = solver_inputs(s, now)
     events = apply_event_settings(s, busy_events) + hold_events(s, now)
     previous: dict[str, list[tuple[datetime, datetime]]] = {}

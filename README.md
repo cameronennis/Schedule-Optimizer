@@ -19,21 +19,13 @@ uv run schedule-optimizer-app --browser   # same UI in a browser tab (http://127
 
 The first launch walks through setup: your day, Google sign-in, and which calendars block time.
 
-## Claude (optional)
+## Natural Language Input (optional)
 
-Claude is optional and off by default; the app works fully without it. Claude never places blocks. It proposes changes to tasks, event skip costs, preferences and holds (time set aside, such as a break). You approve them, and the solver re-plans. Pick a mode in Preferences › Claude.
+Without an API key or Claude Desktop, the app is 100% functional, offline too. Claude never places blocks: it proposes changes to tasks, event skip costs, preferences and holds (time set aside, such as a break), you approve them, and the solver re-plans. Set it up in Preferences › Natural Language Input.
 
-**Claude Desktop** (uses your Claude plan). The helper does nothing unless this mode is on: with Claude set to Off, it offers Claude Desktop no tools. Even when on, it works only in chats you activate: **Start a Claude chat** copies `ACTIVATE SCHEDULE OPTIMIZER FOR THIS CHAT (code …)` to paste into a chat; codes last 12 hours and can be ended in Preferences. Releases will install it with a "Connect to Claude" button. During development, add the helper to Claude Desktop's config (Settings › Developer › Edit Config), then fully quit and reopen Claude Desktop. Preferences shows the exact entry for this checkout; it looks like:
+**API key** (billed per use): paste a key from the Claude Console; it's stored in the OS keychain. Chat in the Claude tab, with a monthly spending cap. Claude can only propose; you click **Apply**.
 
-```json
-{"mcpServers": {"schedule-optimizer": {
-  "command": "/Users/you/.local/bin/uv",
-  "args": ["run", "--directory", "/path/to/Schedule Optimizer", "schedule-optimizer-mcp"]}}}
-```
-
-Tools: `get_plan`, `get_tasks`, `create_task`, `propose_changes`, `apply_changes`, `solve`, `explain_block`. Claude Desktop asks before running the ones that change things. New plans, and breaks, still need **Approve plan** in the app before they're written to the Optimizer calendar.
-
-**API key** (billed per use). Paste a key from the Claude Console in Preferences; it's stored in the OS keychain. A Claude tab appears for chatting, with a monthly spending cap. In this mode Claude can only propose; you click **Apply** in the app.
+**Claude Desktop** (uses your Claude plan): click **Add it for me** (it saves a copy of Claude Desktop's config first, so **Undo** restores it), then fully quit and reopen Claude Desktop. Manual steps are under "Set it up manually instead." It works only in chats you activate: **Start a Claude chat** copies `ACTIVATE SCHEDULE OPTIMIZER FOR THIS CHAT (code …)` to paste as a chat's first message; codes last 12 hours and can be ended in Preferences. Tools: `get_plan`, `get_tasks`, `create_task`, `propose_changes`, `apply_changes`, `solve`, `explain_block`. New plans still need **Approve plan** in the app.
 
 ## Command line
 

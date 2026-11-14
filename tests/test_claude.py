@@ -13,7 +13,7 @@ from schedule_optimizer.demo import NOW, at
 from schedule_optimizer.diagnose import diagnose
 from schedule_optimizer.domain import EventInput, Preferences, TaskInput
 from schedule_optimizer.solver import solve
-from schedule_optimizer.tables import Proposal, ProposalStatus
+from schedule_optimizer.tables import ClaudeMode, Proposal, ProposalStatus
 
 CTX = claude_tools.Ctx(source="test", now=lambda: NOW)
 
@@ -165,8 +165,9 @@ async def test_mcp_server_lists_and_runs_tools(tmp_path):
 
     eng = db.make_engine(tmp_path / "schedule.db")
     with Session(eng) as s:
-        store.update_prefs(s, time_zone="America/Los_Angeles")
+        store.update_prefs(s, time_zone="America/Los_Angeles", claude_mode=ClaudeMode.DESKTOP)
         store.add_task(s, title="Essay", total_minutes=120)
+        code = store.new_chat_code(s).code
     eng.dispose()
 
     params = StdioServerParameters(
@@ -178,11 +179,11 @@ async def test_mcp_server_lists_and_runs_tools(tmp_path):
         names = {t.name for t in (await session.list_tools()).tools}
         assert names == {"get_plan", "get_tasks", "create_task", "propose_changes", "apply_changes",
                          "solve", "explain_block"}
-        result = await session.call_tool("solve", {})
+        result = await session.call_tool("solve", {"chat_code": code})
         assert not result.is_error
         body = json.loads(result.content[0].text)
         assert body["planned_minutes"] == 120
-        bad = await session.call_tool("apply_changes", {"proposal_id": 99})
+        bad = await session.call_tool("apply_changes", {"chat_code": code, "proposal_id": 99})
         assert bad.is_error and "no proposal" in bad.content[0].text
 
 
@@ -248,3 +249,73 @@ def test_solve_tool_reports_optimality_and_accepts_a_longer_limit(s):
     store.add_task(s, title="Essay", total_minutes=60)
     out = claude_tools.run_tool(s, "solve", {"seconds": 10}, CTX)
     assert out["optimal"] is True and "not_fully_optimized" not in out
+
+
+
+async def test_mcp_server_does_nothing_unless_turned_on(tmp_path):
+    """Claude is optional: with Claude mode Off (the default), an installed helper offers
+    no tools and refuses calls, so nothing in an unrelated chat can use it."""
+    from mcp.client.session import ClientSession
+    from mcp.client.stdio import StdioServerParameters, stdio_client
+
+    eng = db.make_engine(tmp_path / "schedule.db")
+    with Session(eng) as s:
+        store.update_prefs(s, time_zone="America/Los_Angeles")
+        store.add_task(s, title="Essay", total_minutes=120)
+        assert store.get_prefs(s).claude_mode == ClaudeMode.OFF  # the default
+    params = StdioServerParameters(
+        command=sys.executable, args=["-m", "schedule_optimizer.mcp_server"],
+        env={**os.environ, "SCHEDULE_OPTIMIZER_DATA_DIR": str(tmp_path), "SCHEDULE_OPTIMIZER_OFFLINE": "1"},
+    )
+    async with stdio_client(params) as (read, write), ClientSession(read, write) as session:
+        await session.initialize()
+        assert (await session.list_tools()).tools == []
+        result = await session.call_tool("solve", {})
+        assert result.is_error and "turned off" in result.content[0].text
+        with Session(eng) as s:
+            assert store.last_solve(s) is None  # nothing ran
+
+        with Session(eng) as s:  # turning it on works without restarting the helper
+            store.update_prefs(s, claude_mode=ClaudeMode.DESKTOP)
+            code = store.new_chat_code(s).code
+        assert len((await session.list_tools()).tools) == 7
+        with Session(eng) as s:  # and turning it off again blocks calls right away
+            store.update_prefs(s, claude_mode=ClaudeMode.OFF)
+        assert (await session.call_tool("get_plan", {"chat_code": code})).is_error
+    eng.dispose()
+
+
+
+async def test_mcp_server_works_only_in_an_activated_chat(tmp_path):
+    """A chat without the pasted code can't use the tools, even with Claude Desktop mode on."""
+    from mcp.client.session import ClientSession
+    from mcp.client.stdio import StdioServerParameters, stdio_client
+
+    eng = db.make_engine(tmp_path / "schedule.db")
+    with Session(eng) as s:
+        store.update_prefs(s, time_zone="America/Los_Angeles", claude_mode=ClaudeMode.DESKTOP)
+        code = store.new_chat_code(s).code
+    params = StdioServerParameters(
+        command=sys.executable, args=["-m", "schedule_optimizer.mcp_server"],
+        env={**os.environ, "SCHEDULE_OPTIMIZER_DATA_DIR": str(tmp_path), "SCHEDULE_OPTIMIZER_OFFLINE": "1"},
+    )
+    async with stdio_client(params) as (read, write), ClientSession(read, write) as session:
+        init = await session.initialize()
+        assert "ACTIVATE SCHEDULE OPTIMIZER FOR THIS CHAT" in (init.instructions or "")
+        tools = (await session.list_tools()).tools
+        assert all("chat_code" in t.input_schema["required"] for t in tools)
+        for args in ({}, {"chat_code": "ABC-DEF"}):
+            r = await session.call_tool("get_plan", args)
+            assert r.is_error and "isn't active in this chat" in r.content[0].text
+        assert not (await session.call_tool("get_plan", {"chat_code": code.lower()})).is_error
+        with Session(eng) as s:
+            assert store.revoke_chat_codes(s) == 1
+        assert (await session.call_tool("get_plan", {"chat_code": code})).is_error
+    eng.dispose()
+
+
+def test_chat_codes_expire(s):
+    row = store.new_chat_code(s, now=NOW)
+    assert store.activation_message(row.code) == f"ACTIVATE SCHEDULE OPTIMIZER FOR THIS CHAT (code {row.code})"
+    assert store.chat_code_is_active(s, row.code, now=NOW + timedelta(hours=11))
+    assert not store.chat_code_is_active(s, row.code, now=NOW + timedelta(hours=13))

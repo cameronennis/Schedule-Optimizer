@@ -243,3 +243,17 @@ async def test_optimal_plan_says_so(app_db):
         await user.open("/")
         await user.should_see("optimal")
         await user.should_not_see("not fully optimized")
+
+
+
+async def test_start_a_claude_chat_copies_the_activation_message(app_db):
+    finish_setup()
+    with db.session() as s:
+        store.update_prefs(s, claude_mode=ClaudeMode.DESKTOP)
+    async with user_simulation(root=ui_app.root) as user:
+        await user.open("/")
+        user.find("Preferences").click()
+        user.find(marker="start-claude-chat").click()
+        await user.should_see("ACTIVATE SCHEDULE OPTIMIZER FOR THIS CHAT")
+    with db.session() as s:
+        assert len(store.active_chat_codes(s)) == 1

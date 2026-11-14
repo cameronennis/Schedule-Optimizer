@@ -203,3 +203,17 @@ class ApiUsage(SQLModel, table=True):
     input_tokens: int = 0
     output_tokens: int = 0
     cost_usd: float = 0.0
+
+
+class ChatCode(SQLModel, table=True):
+    """Lets one Claude Desktop chat use the helper (schema v5).
+
+    The app makes a code and copies "ACTIVATE SCHEDULE OPTIMIZER FOR THIS CHAT (code …)"
+    for you to paste into a chat. Every helper call must carry an active code, so a chat
+    you never pasted it into can't use the tools, even if the connector is on there.
+    """
+
+    code: str = Field(primary_key=True)
+    created_at: datetime = _dt(default_factory=utcnow)
+    expires_at: datetime = _dt()
+    revoked: bool = False

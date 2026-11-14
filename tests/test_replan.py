@@ -206,7 +206,7 @@ def test_phase4_database_upgrades_to_latest(tmp_path):
         conn.execute(text("ALTER TABLE preferences DROP COLUMN stability_per_hour"))
         conn.execute(text("ALTER TABLE preferences DROP COLUMN optimizer_calendar_id"))
         conn.execute(text("ALTER TABLE preferences DROP COLUMN claude_monthly_cap_usd"))  # v3 additions
-        for table in ("proposal", "hold", "lastsolve", "apiusage"):
+        for table in ("proposal", "hold", "lastsolve", "apiusage", "chatcode"):
             conn.execute(text(f"DROP TABLE {table}"))
         conn.execute(text("INSERT INTO preferences (id, awake_start, awake_end, max_focus_minutes_per_day, "
                           "buffer_minutes, horizon_days, busy_calendars, claude_mode, setup_complete, chunk_cost, "
@@ -222,7 +222,7 @@ def test_phase4_database_upgrades_to_latest(tmp_path):
         assert p.stability_per_hour == 1.0 and p.optimizer_calendar_id is None
         assert p.claude_monthly_cap_usd == 5.0 and store.list_holds(session) == []
     eng.dispose()
-    assert sqlite3.connect(path).execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION == 4
+    assert sqlite3.connect(path).execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION == 5
 
 
 # ---- Optimizer calendar sync ---------------------------------------------------------

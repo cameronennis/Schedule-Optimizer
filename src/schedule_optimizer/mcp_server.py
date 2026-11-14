@@ -4,8 +4,15 @@ Claude Desktop starts this program and talks to it through stdin/stdout. It uses
 the same database file as the app window (WAL mode lets both write), so the
 window doesn't need to be open. Tools are defined once in claude_tools.
 
+It's optional and off by default: unless the app's Claude mode is "Claude
+Desktop", it offers no tools and refuses every call, so installing it changes
+nothing until you turn it on. Even then it works only in chats you activate:
+"Start a Claude chat" in the app copies "ACTIVATE SCHEDULE OPTIMIZER FOR THIS CHAT
+(code …)", and every call must carry an active code (12 hours, revocable).
+
 During development, register it in Claude Desktop's config with `uv run`
-(see README), then fully quit and reopen Claude Desktop.
+(see README), then fully quit and reopen Claude Desktop. Releases install it
+through a .mcpb file instead (Phase 9), so users never edit a config file.
 """
 
 from __future__ import annotations
@@ -20,8 +27,21 @@ from mcp.server.lowlevel import Server
 from mcp.server.stdio import stdio_server
 
 from . import claude_tools, db, store
+from .tables import ClaudeMode
 
-INSTRUCTIONS = claude_tools.INSTRUCTIONS + claude_tools.DESKTOP_INSTRUCTIONS
+ACTIVATION = f"""\
+IMPORTANT: Use these tools only in a chat where the user has pasted
+"{store.ACTIVATION_PHRASE} (code XXX-XXX)". Pass that code as `chat_code` on
+every call. Never guess or reuse a code from elsewhere. If the user asks about their
+schedule without it, tell them to click "Start a Claude chat" in the Schedule
+Optimizer app and paste the message it copies.
+
+"""
+INSTRUCTIONS = ACTIVATION + claude_tools.INSTRUCTIONS + claude_tools.DESKTOP_INSTRUCTIONS
+CHAT_CODE_FIELD = {
+    "type": "string",
+    "description": f"The code from \"{store.ACTIVATION_PHRASE} (code …)\" in this chat. Required.",
+}
 
 log = logging.getLogger(__name__)
 CTX = claude_tools.Ctx(source="claude-desktop", now=lambda: _now())
@@ -34,10 +54,13 @@ def _now() -> datetime:
 
 def _tool(name: str, spec: dict) -> types.Tool:
     read_only = spec["read_only"]
+    schema = dict(spec["input_schema"])
+    schema["properties"] = {"chat_code": CHAT_CODE_FIELD, **schema.get("properties", {})}
+    schema["required"] = ["chat_code", *schema.get("required", [])]
     return types.Tool(
         name=name,
-        description=spec["description"],
-        input_schema=spec["input_schema"],
+        description=spec["description"] + " Only in a chat activated with a chat code.",
+        input_schema=schema,
         annotations=types.ToolAnnotations(
             read_only_hint=read_only,
             destructive_hint=False if read_only else name in ("apply_changes",),
@@ -46,18 +69,49 @@ def _tool(name: str, spec: dict) -> types.Tool:
     )
 
 
-def _call(name: str, args: dict) -> dict:
+OFF_MESSAGE = ("Claude Desktop is turned off in Schedule Optimizer. To use it, open the app and choose "
+               "Preferences › Claude › Claude Desktop.")
+
+
+def _enabled() -> bool:
+    """The helper does nothing unless the app's Claude mode is Claude Desktop."""
     with db.session() as s:
+        return store.get_prefs(s).claude_mode == ClaudeMode.DESKTOP
+
+
+NOT_ACTIVE_MESSAGE = (
+    "Schedule Optimizer isn't active in this chat. To use it here, click “Start a Claude chat” in the "
+    f"Schedule Optimizer app, then paste the message it copies (“{store.ACTIVATION_PHRASE} (code …)”)."
+)
+
+
+class NotActive(Exception):
+    pass
+
+
+def _call(name: str, args: dict) -> dict:
+    args = dict(args)
+    code = args.pop("chat_code", None)
+    with db.session() as s:
+        if not store.chat_code_is_active(s, code):
+            raise NotActive(NOT_ACTIVE_MESSAGE)
         return claude_tools.run_tool(s, name, args, CTX)
 
 
 async def list_tools(ctx, params) -> types.ListToolsResult:
+    # Off: offer no tools at all, so nothing in an unrelated chat can trigger them.
+    if not await anyio.to_thread.run_sync(_enabled):
+        return types.ListToolsResult(tools=[])
     return types.ListToolsResult(tools=[_tool(n, spec) for n, spec in claude_tools.TOOLS.items()])
 
 
 async def call_tool(ctx, params: types.CallToolRequestParams) -> types.CallToolResult:
+    if not await anyio.to_thread.run_sync(_enabled):  # turned off after Claude Desktop listed the tools
+        return types.CallToolResult(content=[types.TextContent(type="text", text=OFF_MESSAGE)], is_error=True)
     try:
         result = await anyio.to_thread.run_sync(_call, params.name, params.arguments or {})
+    except NotActive as e:
+        return types.CallToolResult(content=[types.TextContent(type="text", text=str(e))], is_error=True)
     except (ValueError, KeyError) as e:
         msg = e.args[0] if isinstance(e, KeyError) and e.args else str(e)
         return types.CallToolResult(content=[types.TextContent(type="text", text=f"Error: {msg}")], is_error=True)

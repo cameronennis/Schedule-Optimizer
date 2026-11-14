@@ -234,6 +234,11 @@ async def _calendar_picker() -> None:
 # ---- Now -------------------------------------------------------------------------------
 
 
+def _claude_mode() -> ClaudeMode:
+    with db.session() as s:
+        return store.get_prefs(s).claude_mode
+
+
 def _use_google() -> bool:
     if not google_auth.is_signed_in():
         return False
@@ -351,6 +356,8 @@ def now_view() -> None:
             .props("" if can_approve or holds else "disable") \
             .tooltip("Saves this plan and writes it, with any breaks, to your Optimizer calendar")
         ui.button("Log progress", icon="timer", on_click=lambda: open_log_dialog()).props("outline").mark("log")
+        if _claude_mode() == ClaudeMode.DESKTOP:
+            ui.button("Start a Claude chat", icon="chat", on_click=start_claude_chat).props("outline")
         ui.label("Using Google Calendar" if _use_google() else "Offline: Google Calendar not used") \
             .classes("text-sm text-gray-500 ml-2")
 
@@ -859,6 +866,23 @@ def prefs_view() -> None:
     claude_prefs()
 
 
+def start_claude_chat() -> None:
+    """Make a chat code and copy the activation message for pasting into Claude Desktop."""
+    with db.session() as s:
+        row = store.new_chat_code(s)
+    message = store.activation_message(row.code)
+    ui.clipboard.write(message)
+    with ui.dialog() as dialog, ui.card().classes("w-[32rem]"):
+        ui.label("Paste this into the Claude Desktop chat you want to use").classes("text-lg font-medium")
+        ui.code(message).classes("w-full").mark("activation-message")
+        ui.label(f"It's copied to your clipboard. Only that chat can use Schedule Optimizer, for "
+                 f"{store.CHAT_CODE_HOURS} hours or until you end Claude chats in Preferences.") \
+            .classes("text-sm text-gray-500")
+        with ui.row().classes("w-full justify-end"):
+            ui.button("Done", on_click=dialog.close)
+    dialog.open()
+
+
 def desktop_config() -> dict:
     """The Claude Desktop config entry for running the helper from this checkout (development)."""
     project = Path(__file__).resolve().parents[2]
@@ -886,8 +910,25 @@ def claude_prefs() -> None:
         .mark("claude-mode")
 
     if prefs.claude_mode == ClaudeMode.DESKTOP:
-        ui.label("Add this to Claude Desktop's config (Settings › Developer › Edit Config), "
-                 "then fully quit and reopen Claude Desktop.").classes("text-sm mt-2")
+        ui.label("Claude Desktop works only in chats you activate: click “Start a Claude chat” and paste the "
+                 "message into that chat. Claude asks you before each change. Choose Off to stop it entirely.") \
+            .classes("text-sm mt-2")
+        with db.session() as s:
+            active = len(store.active_chat_codes(s))
+        with ui.row().classes("items-center gap-3"):
+            ui.button("Start a Claude chat", icon="chat", on_click=start_claude_chat).mark("start-claude-chat")
+            if active:
+                def end_all() -> None:
+                    with db.session() as s:
+                        n = store.revoke_chat_codes(s)
+                    ui.notify(f"Ended {n} Claude chat{'s' if n != 1 else ''}.")
+                    root_view.refresh()
+
+                ui.label(f"{active} active chat{'s' if active != 1 else ''}").classes("text-sm text-gray-500")
+                ui.button("End all Claude chats", on_click=end_all).props("flat dense").mark("end-claude-chats")
+        ui.label("Developer setup (a one-click “Connect to Claude” button replaces this in the release): add "
+                 "this to Claude Desktop's config (Settings › Developer › Edit Config), then fully quit and reopen "
+                 "Claude Desktop.").classes("text-sm text-gray-500 mt-2")
         snippet = json.dumps(desktop_config(), indent=2)
         ui.code(snippet, language="json").classes("w-full")
         ui.label("If the file already has an \"mcpServers\" section, add just the \"schedule-optimizer\" entry "

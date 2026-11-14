@@ -21,9 +21,9 @@ The first launch walks through setup: your day, Google sign-in, and which calend
 
 ## Claude (optional)
 
-Claude never places blocks. It proposes changes to tasks, event skip costs, preferences and holds (time set aside, such as a break). You approve them, and the solver re-plans. Pick a mode in Preferences › Claude.
+Claude is optional and off by default; the app works fully without it. Claude never places blocks. It proposes changes to tasks, event skip costs, preferences and holds (time set aside, such as a break). You approve them, and the solver re-plans. Pick a mode in Preferences › Claude.
 
-**Claude Desktop** (uses your Claude plan). During development, add the helper to Claude Desktop's config (Settings › Developer › Edit Config), then fully quit and reopen Claude Desktop. Preferences shows the exact entry for this checkout; it looks like:
+**Claude Desktop** (uses your Claude plan). The helper does nothing unless this mode is on: with Claude set to Off, it offers Claude Desktop no tools. Even when on, it works only in chats you activate: **Start a Claude chat** copies `ACTIVATE SCHEDULE OPTIMIZER FOR THIS CHAT (code …)` to paste into a chat; codes last 12 hours and can be ended in Preferences. Releases will install it with a "Connect to Claude" button. During development, add the helper to Claude Desktop's config (Settings › Developer › Edit Config), then fully quit and reopen Claude Desktop. Preferences shows the exact entry for this checkout; it looks like:
 
 ```json
 {"mcpServers": {"schedule-optimizer": {

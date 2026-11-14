@@ -45,7 +45,12 @@ def _v3_to_v4(conn) -> None:
         conn.execute(text("ALTER TABLE lastsolve ADD COLUMN approved_at DATETIME"))
 
 
-MIGRATIONS: list[Callable] = [_v1_to_v2, _v2_to_v3, _v3_to_v4]
+def _v4_to_v5(conn) -> None:
+    """Chat codes: Claude Desktop works only in chats you activate."""
+    tables.ChatCode.__table__.create(conn)
+
+
+MIGRATIONS: list[Callable] = [_v1_to_v2, _v2_to_v3, _v3_to_v4, _v4_to_v5]
 SCHEMA_VERSION = 1 + len(MIGRATIONS)
 
 

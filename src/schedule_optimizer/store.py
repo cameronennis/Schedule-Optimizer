@@ -7,6 +7,7 @@ the Claude Desktop helper all share one set of rules.
 from __future__ import annotations
 
 from dataclasses import asdict
+import secrets
 from datetime import datetime, time, timedelta, timezone, tzinfo
 from zoneinfo import ZoneInfo
 
@@ -19,6 +20,7 @@ from .domain import EventInput, Plan, TaskInput, WeeklyTask
 from .solver import solve
 from .tables import (
     BlockStatus,
+    ChatCode,
     EffortMode,
     EventMeta,
     Hold,
@@ -488,3 +490,47 @@ def approve_plan(s: Session) -> int:
         s.add(row)
     s.commit()
     return count
+
+
+# ---- chat codes: which Claude Desktop chats may use the helper -------------------------
+
+CHAT_CODE_HOURS = 12
+ACTIVATION_PHRASE = "ACTIVATE SCHEDULE OPTIMIZER FOR THIS CHAT"
+_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # no 0/O or 1/I look-alikes
+
+
+def new_chat_code(s: Session, now: datetime | None = None) -> ChatCode:
+    now = now or datetime.now(timezone.utc)
+    raw = "".join(secrets.choice(_CODE_ALPHABET) for _ in range(6))
+    row = ChatCode(code=f"{raw[:3]}-{raw[3:]}", created_at=now, expires_at=now + timedelta(hours=CHAT_CODE_HOURS))
+    s.add(row)
+    s.commit()
+    s.refresh(row)
+    return row
+
+
+def activation_message(code: str) -> str:
+    return f"{ACTIVATION_PHRASE} (code {code})"
+
+
+def chat_code_is_active(s: Session, code: str | None, now: datetime | None = None) -> bool:
+    if not code:
+        return False
+    now = now or datetime.now(timezone.utc)
+    row = s.get(ChatCode, code.strip().upper())
+    return row is not None and not row.revoked and row.expires_at > now
+
+
+def active_chat_codes(s: Session, now: datetime | None = None) -> list[ChatCode]:
+    now = now or datetime.now(timezone.utc)
+    q = select(ChatCode).where(ChatCode.revoked == False, ChatCode.expires_at > now)  # noqa: E712
+    return list(s.exec(q.order_by(ChatCode.created_at)))
+
+
+def revoke_chat_codes(s: Session) -> int:
+    rows = active_chat_codes(s)
+    for r in rows:
+        r.revoked = True
+        s.add(r)
+    s.commit()
+    return len(rows)

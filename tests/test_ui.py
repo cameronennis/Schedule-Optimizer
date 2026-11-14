@@ -307,3 +307,21 @@ async def test_saving_an_api_key_stays_on_preferences(app_db, monkeypatch):
         user.find(marker="api-key-save").click()
         await user.should_see(marker="api-key-remove", retries=100)
         assert ui_app.STATE["tab"] == "Preferences"
+
+
+
+async def test_end_one_claude_chat_keeps_the_others(app_db):
+    finish_setup()
+    with db.session() as s:
+        a, b = store.new_chat_code(s), store.new_chat_code(s)
+        store.use_chat_code(s, b.code)
+    async with user_simulation(root=ui_app.root) as user:
+        await user.open("/")
+        user.find("Preferences").click()
+        await user.should_see(marker=f"chat-{a.code}")
+        await user.should_see("started")
+        user.find(marker=f"end-{a.code}").click()
+        await user.should_not_see(marker=f"chat-{a.code}")
+        await user.should_see(marker=f"chat-{b.code}")
+    with db.session() as s:
+        assert [c.code for c in store.active_chat_codes(s)] == [b.code]

@@ -334,7 +334,7 @@ def plan_now(
     a plan that hit the limit has status FEASIBLE (good, not proven best) instead of OPTIMAL.
     """
     prefs = get_prefs(s)
-    purge_done_tasks(s, now)
+    purge_done_tasks(s)  # wall-clock time, like the completion time it compares against
     tasks, weekly = solver_inputs(s, now)
     events = apply_event_settings(s, busy_events) + hold_events(s, now)
     previous: dict[str, list[tuple[datetime, datetime]]] = {}
@@ -515,15 +515,15 @@ def approve_plan(s: Session) -> int:
 
 # ---- chat codes: which Claude Desktop chats may use the helper -------------------------
 
-CHAT_CODE_HOURS = 12
 ACTIVATION_PHRASE = "ACTIVATE SCHEDULE OPTIMIZER FOR THIS CHAT"
 _CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # no 0/O or 1/I look-alikes
 
 
 def new_chat_code(s: Session, now: datetime | None = None) -> ChatCode:
+    """A new code for one Claude Desktop chat. It works until you end it."""
     now = now or datetime.now(timezone.utc)
     raw = "".join(secrets.choice(_CODE_ALPHABET) for _ in range(6))
-    row = ChatCode(code=f"{raw[:3]}-{raw[3:]}", created_at=now, expires_at=now + timedelta(hours=CHAT_CODE_HOURS))
+    row = ChatCode(code=f"{raw[:3]}-{raw[3:]}", created_at=now, expires_at=now)
     s.add(row)
     s.commit()
     s.refresh(row)
@@ -534,21 +534,44 @@ def activation_message(code: str) -> str:
     return f"{ACTIVATION_PHRASE} (code {code})"
 
 
-def chat_code_is_active(s: Session, code: str | None, now: datetime | None = None) -> bool:
+def _code_row(s: Session, code: str | None) -> ChatCode | None:
     if not code:
-        return False
-    now = now or datetime.now(timezone.utc)
+        return None
     row = s.get(ChatCode, code.strip().upper())
-    return row is not None and not row.revoked and row.expires_at > now
+    return row if row is not None and not row.revoked else None
 
 
-def active_chat_codes(s: Session, now: datetime | None = None) -> list[ChatCode]:
-    now = now or datetime.now(timezone.utc)
-    q = select(ChatCode).where(ChatCode.revoked == False, ChatCode.expires_at > now)  # noqa: E712
+def chat_code_is_active(s: Session, code: str | None) -> bool:
+    return _code_row(s, code) is not None
+
+
+def use_chat_code(s: Session, code: str | None, now: datetime | None = None) -> bool:
+    """Check a code from a tool call and note when it was used. False if it isn't active."""
+    row = _code_row(s, code)
+    if row is None:
+        return False
+    row.last_used_at = now or datetime.now(timezone.utc)
+    s.add(row)
+    s.commit()
+    return True
+
+
+def active_chat_codes(s: Session) -> list[ChatCode]:
+    q = select(ChatCode).where(ChatCode.revoked == False)  # noqa: E712
     return list(s.exec(q.order_by(ChatCode.created_at)))
 
 
+def end_chat_code(s: Session, code: str) -> None:
+    row = _code_row(s, code)
+    if row is None:
+        raise KeyError(f"no active chat with code {code}")
+    row.revoked = True
+    s.add(row)
+    s.commit()
+
+
 def revoke_chat_codes(s: Session) -> int:
+    """End every active chat."""
     rows = active_chat_codes(s)
     for r in rows:
         r.revoked = True

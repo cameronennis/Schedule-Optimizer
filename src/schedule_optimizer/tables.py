@@ -213,9 +213,11 @@ class ChatCode(SQLModel, table=True):
     The app makes a code and copies "ACTIVATE SCHEDULE OPTIMIZER FOR THIS CHAT (code …)"
     for you to paste into a chat. Every helper call must carry an active code, so a chat
     you never pasted it into can't use the tools, even if the connector is on there.
+    Codes last until you end them in the app, one at a time or all at once.
     """
 
     code: str = Field(primary_key=True)
     created_at: datetime = _dt(default_factory=utcnow)
-    expires_at: datetime = _dt()
+    expires_at: datetime = _dt()  # unused since schema v7: codes last until you end them
     revoked: bool = False
+    last_used_at: datetime | None = _dt(default=None)  # last tool call with this code (v7)

@@ -34,7 +34,7 @@ A local desktop app that reads Google Calendar, takes tasks with weights, and us
 
 - A separate entry point, `mcp_server.py`, built with the MCP Python SDK. It imports the same core modules and uses the same SQLite file (WAL mode on).
 - Tools: `get_plan`, `get_tasks`, `create_task`, `propose_changes`, `apply_changes`, `solve`, `explain_block`.
-- Fully optional: it works only in chats I activate: "Start a Claude chat" in the app copies "ACTIVATE SCHEDULE OPTIMIZER FOR THIS CHAT (code XXX-XXX)", and every tool call needs an active code (12 h, revocable). Claude Desktop can't start a connector switched off per chat, so this is enforced on our side.
+- Fully optional: it works only in chats I activate: "Start a Claude chat" in the app copies "ACTIVATE SCHEDULE OPTIMIZER FOR THIS CHAT (code XXX-XXX)", and every tool call needs an active code. Codes don't expire; I end them one at a time (or all) in Preferences, which lists each code with when it was started. Claude Desktop can't start a connector switched off per chat, so this is enforced on our side.
 - During development, "Add it for me" in Preferences adds a `uv run` entry to Claude Desktop's config (backing up the original so Undo restores it exactly); manual steps are in a collapsed section. Then fully quit and reopen Claude Desktop.
 - For release, build the helper as a standalone binary with PyInstaller and pack it with the mcpb CLI. Ship the `.mcpb` inside the app; a "Connect to Claude" button opens it so Claude Desktop shows its install window.
 

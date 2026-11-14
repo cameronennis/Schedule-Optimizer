@@ -60,8 +60,19 @@ def _v5_to_v6(conn) -> None:
                  {"now": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")})  # SQLAlchemy's format
 
 
-MIGRATIONS: list[Callable] = [_v1_to_v2, _v2_to_v3, _v3_to_v4, _v4_to_v5, _v5_to_v6]
+def _v6_to_v7(conn) -> None:
+    """Chat codes: no expiry, ended one at a time; remember when each was last used."""
+    columns = {r[1] for r in conn.execute(text("PRAGMA table_info(chatcode)"))}
+    if "last_used_at" not in columns:  # v5's create() already uses today's table on a one-go upgrade
+        conn.execute(text("ALTER TABLE chatcode ADD COLUMN last_used_at DATETIME"))
+
+
+MIGRATIONS: list[Callable] = [_v1_to_v2, _v2_to_v3, _v3_to_v4, _v4_to_v5, _v5_to_v6, _v6_to_v7]
 SCHEMA_VERSION = 1 + len(MIGRATIONS)
+
+
+class NewerDataError(RuntimeError):
+    pass
 
 
 def db_path() -> Path:
@@ -87,6 +98,11 @@ def make_engine(path: Path | None = None) -> Engine:
 def _migrate(engine: Engine) -> None:
     with engine.begin() as conn:
         version = conn.execute(text("PRAGMA user_version")).scalar_one()
+        latest = 1 + len(MIGRATIONS)
+        if version > latest:  # e.g. an old Claude Desktop helper still running after an update
+            raise NewerDataError(
+                f"This data was saved by a newer version of Schedule Optimizer (data v{version}, this copy "
+                f"understands v{latest}). Restart it, or fully quit and reopen Claude Desktop.")
         if version == 0:
             SQLModel.metadata.create_all(conn)
             conn.execute(text(f"PRAGMA user_version = {SCHEMA_VERSION}"))

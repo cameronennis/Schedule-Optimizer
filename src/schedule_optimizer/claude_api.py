@@ -24,7 +24,7 @@ from .tables import ApiUsage
 
 KEYRING_SERVICE = "Schedule Optimizer"
 KEYRING_USER = "anthropic-api-key"
-MODEL = "claude-opus-5-5"
+MODEL = "claude-sonnet-5-5"  # cheaper than Opus and plenty for planning chat
 FALLBACK_BETA = "server-side-fallback-2026-07-01"
 MAX_TOOL_ROUNDS = 10
 

@@ -216,11 +216,11 @@ def test_api_chat_proposes_but_cannot_apply(s, tmp_path):
     walk = {"summary": "A walk first", "changes": [
         {"op": "add_hold", "title": "Walk", "start": "2026-11-18T08:00", "end": "2026-11-18T08:20"}]}
     client = FakeClient([
-        NS(model="claude-opus-5-5", stop_reason="tool_use", usage=usage(), content=[
+        NS(model="claude-sonnet-5-5", stop_reason="tool_use", usage=usage(), content=[
             NS(type="text", text="Let me look."),
             NS(type="tool_use", id="t1", name="propose_changes", input=walk),
             NS(type="tool_use", id="t2", name="apply_changes", input={"proposal_id": 1})]),
-        NS(model="claude-opus-5-5", stop_reason="end_turn", usage=usage(), content=[
+        NS(model="claude-sonnet-5-5", stop_reason="end_turn", usage=usage(), content=[
             NS(type="text", text="I suggested a walk; apply it in the app.")]),
     ])
     chat = claude_api.Chat()
@@ -231,9 +231,9 @@ def test_api_chat_proposes_but_cannot_apply(s, tmp_path):
     assert store.list_holds(s) == []  # nothing applied
     tools = {t["name"] for t in client.requests[0]["tools"]}
     assert "apply_changes" not in tools and "propose_changes" in tools
-    assert client.requests[0]["model"] == "claude-opus-5-5"
+    assert client.requests[0]["model"] == "claude-sonnet-5-5"
     spent = claude_api.month_usage(s).cost_usd
-    assert spent == pytest.approx(2 * (1000 * 4 + 200 * 20) / 1e6)
+    assert spent == pytest.approx(2 * (1000 * 2 + 200 * 10) / 1e6)  # Sonnet 5.5 prices
 
 
 def test_api_chat_stops_at_the_monthly_cap(s):
@@ -307,11 +307,17 @@ async def test_mcp_server_works_only_in_an_activated_chat(tmp_path):
     eng.dispose()
 
 
-def test_chat_codes_expire(s):
-    row = store.new_chat_code(s, now=NOW)
-    assert store.activation_message(row.code) == f"ACTIVATE SCHEDULE OPTIMIZER FOR THIS CHAT (code {row.code})"
-    assert store.chat_code_is_active(s, row.code, now=NOW + timedelta(hours=11))
-    assert not store.chat_code_is_active(s, row.code, now=NOW + timedelta(hours=13))
+def test_chat_codes_last_until_ended_one_at_a_time(s):
+    a, b = store.new_chat_code(s, now=NOW), store.new_chat_code(s, now=NOW)
+    assert store.activation_message(a.code) == f"ACTIVATE SCHEDULE OPTIMIZER FOR THIS CHAT (code {a.code})"
+    assert store.chat_code_is_active(s, a.code)  # no expiry, however old
+    assert store.use_chat_code(s, b.code, now=NOW + timedelta(days=30))
+    assert s.get(type(b), b.code).last_used_at == NOW + timedelta(days=30)
+    store.end_chat_code(s, a.code)
+    assert not store.chat_code_is_active(s, a.code) and store.chat_code_is_active(s, b.code)
+    assert [c.code for c in store.active_chat_codes(s)] == [b.code]
+    with pytest.raises(KeyError):
+        store.end_chat_code(s, a.code)
 
 
 
@@ -406,3 +412,29 @@ def test_clipboard_uses_the_system_tool(monkeypatch):
 
     monkeypatch.setattr(subprocess, "run", fail)
     assert clipboard.copy("x") is False  # falls back to the browser clipboard in the app
+
+
+def test_outdated_helper_refuses_to_run(monkeypatch):
+    """Regression: Claude Desktop kept an old helper running after an update, and that copy
+    ignored chat codes. A helper whose code changed since it started now refuses every call."""
+    import anyio
+
+    from schedule_optimizer import mcp_server
+
+    monkeypatch.setattr(mcp_server, "_source_fingerprint", lambda: ("changed",))
+    params = mcp_server.types.CallToolRequestParams(name="get_plan", arguments={"chat_code": "ANY-ONE"})
+    result = anyio.run(mcp_server.call_tool, None, params)
+    assert result.is_error and "Fully quit Claude Desktop" in result.content[0].text
+
+
+def test_old_code_refuses_newer_data(tmp_path):
+    import sqlite3
+
+    path = tmp_path / "schedule.db"
+    db.make_engine(path).dispose()
+    con = sqlite3.connect(path)
+    con.execute(f"PRAGMA user_version = {db.SCHEMA_VERSION + 1}")
+    con.commit()
+    con.close()
+    with pytest.raises(db.NewerDataError, match="newer version"):
+        db.make_engine(path)

@@ -6,8 +6,8 @@ window doesn't need to be open. Tools are defined once in claude_tools.
 
 It's optional, and it works only in chats you activate: "Start a Claude chat"
 in the app copies "ACTIVATE SCHEDULE OPTIMIZER FOR THIS CHAT (code …)", and every
-call must carry an active code (12 hours, revocable). Without one, every call is
-refused, so an installed helper does nothing in other chats.
+call must carry an active code (until you end that chat in the app). Without one,
+every call is refused, so an installed helper does nothing in other chats.
 
 During development, register it in Claude Desktop's config with `uv run`
 (see README), then fully quit and reopen Claude Desktop. Releases install it
@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import json
 import logging
+import sys
+from pathlib import Path
 from datetime import datetime, timezone
 
 import anyio
@@ -67,6 +69,27 @@ def _tool(name: str, spec: dict) -> types.Tool:
     )
 
 
+def _source_fingerprint() -> tuple:
+    """When this package's code last changed. Claude Desktop keeps a helper running
+    until it's fully quit, so after an update an old helper (with old rules) could
+    otherwise keep answering. A frozen release build can't change under itself."""
+    if getattr(sys, "frozen", False):
+        return ()
+    return tuple(sorted((f.name, f.stat().st_mtime_ns) for f in Path(__file__).parent.glob("*.py")))
+
+
+STARTED_WITH = _source_fingerprint()
+OUTDATED_MESSAGE = ("Schedule Optimizer was updated since Claude Desktop started it, so this copy is out of date "
+                    "and won't run. Fully quit Claude Desktop (on a Mac, press ⌘Q) and reopen it.")
+
+
+def _outdated() -> bool:
+    try:
+        return _source_fingerprint() != STARTED_WITH
+    except OSError:
+        return True
+
+
 def _seen() -> None:
     """Note that Claude Desktop started the helper, so the app can show "Connected"."""
     with db.session() as s:
@@ -87,7 +110,7 @@ def _call(name: str, args: dict) -> dict:
     args = dict(args)
     code = args.pop("chat_code", None)
     with db.session() as s:
-        if not store.chat_code_is_active(s, code):
+        if not store.use_chat_code(s, code):
             raise NotActive(NOT_ACTIVE_MESSAGE)
         return claude_tools.run_tool(s, name, args, CTX)
 
@@ -101,6 +124,8 @@ async def list_tools(ctx, params) -> types.ListToolsResult:
 
 
 async def call_tool(ctx, params: types.CallToolRequestParams) -> types.CallToolResult:
+    if _outdated():
+        return types.CallToolResult(content=[types.TextContent(type="text", text=OUTDATED_MESSAGE)], is_error=True)
     try:
         result = await anyio.to_thread.run_sync(_call, params.name, params.arguments or {})
     except NotActive as e:

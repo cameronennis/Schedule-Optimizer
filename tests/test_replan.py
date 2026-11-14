@@ -224,7 +224,7 @@ def test_phase4_database_upgrades_to_latest(tmp_path):
         assert p.stability_per_hour == 1.0 and p.optimizer_calendar_id is None
         assert p.claude_monthly_cap_usd == 5.0 and store.list_holds(session) == []
     eng.dispose()
-    assert sqlite3.connect(path).execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION == 6
+    assert sqlite3.connect(path).execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION == 7
 
 
 # ---- Optimizer calendar sync ---------------------------------------------------------

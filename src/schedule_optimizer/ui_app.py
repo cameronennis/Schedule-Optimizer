@@ -905,8 +905,8 @@ def start_claude_chat() -> None:
         ui.label("Paste this as the first message of a new Claude Desktop chat").classes("text-lg font-medium")
         ui.code(message, language="text").classes("w-full").mark("activation-message")
         ui.label(("It's on your clipboard. " if copied else "Copy it (select the text if Copy doesn't work). ")
-                 + f"Then ask, for example, “Plan my afternoon.” Only that chat can use Schedule Optimizer, for "
-                 f"{store.CHAT_CODE_HOURS} hours or until you end Claude chats in Preferences.") \
+                 + "Then ask, for example, “Plan my afternoon.” Only a chat with this code can use Schedule "
+                 "Optimizer, until you end it in Preferences › Natural Language Input.") \
             .classes("text-sm text-gray-500")
         with ui.row().classes("w-full justify-end"):
             def copy_again() -> None:
@@ -935,7 +935,7 @@ def nl_input_view() -> None:
     with db.session() as s:
         prefs = store.get_prefs(s)
         spent = claude_api.month_usage(s).cost_usd
-        active = len(store.active_chat_codes(s))
+        codes = store.active_chat_codes(s)
     zone = store.local_tz(prefs)
 
     def redraw() -> None:
@@ -1051,19 +1051,40 @@ def nl_input_view() -> None:
 
     ui.label("2. Start a chat").classes("text-sm font-medium mt-4")
     ui.label(f"Click below, then paste the copied message (“{store.ACTIVATION_PHRASE} (code …)”) as the first "
-             f"message of a new Claude Desktop chat. Only that chat can use Schedule Optimizer, for "
-             f"{store.CHAT_CODE_HOURS} hours.").classes("text-sm text-gray-500")
-    with ui.row().classes("items-center gap-3"):
-        ui.button("Start a Claude chat", icon="chat", on_click=start_claude_chat).mark("start-claude-chat")
-        if active:
-            def end_all() -> None:
-                with db.session() as s:
-                    n = store.revoke_chat_codes(s)
-                ui.notify(f"Ended {n} Claude chat{'s' if n != 1 else ''}.")
-                nl_input_view.refresh()
+             "message of a new Claude Desktop chat. Only a chat with that code can use Schedule Optimizer, until "
+             "you end it below.").classes("text-sm text-gray-500")
+    ui.button("Start a Claude chat", icon="chat", on_click=start_claude_chat).mark("start-claude-chat")
 
-            ui.label(f"{active} active chat{'s' if active != 1 else ''}").classes("text-sm text-gray-500")
-            ui.button("End all Claude chats", on_click=end_all).props("flat dense").mark("end-claude-chats")
+    if codes:
+        ui.label("Active chats").classes("text-sm font-medium mt-4")
+        ui.label("Each code works in any chat you pasted it into. End one to cut those chats off.") \
+            .classes("text-sm text-gray-500")
+
+        def end_one(code: str) -> None:
+            with db.session() as s:
+                try:
+                    store.end_chat_code(s, code)
+                except KeyError:
+                    pass
+            ui.notify(f"Ended chat {code}.")
+            nl_input_view.refresh()
+
+        def end_all() -> None:
+            with db.session() as s:
+                n = store.revoke_chat_codes(s)
+            ui.notify(f"Ended {n} chat{'s' if n != 1 else ''}.")
+            nl_input_view.refresh()
+
+        for c in codes:
+            started = c.created_at.astimezone(zone)
+            with ui.row().classes("items-center gap-3 pl-2").mark(f"chat-{c.code}"):
+                ui.label(c.code).classes("font-mono text-sm w-20")
+                ui.label(f"started {started:%a %b} {started.day} {started:%H:%M}") \
+                    .classes("text-sm text-gray-600")
+                ui.button("End", on_click=lambda code=c.code: end_one(code)).props("flat dense") \
+                    .mark(f"end-{c.code}")
+        if len(codes) > 1:
+            ui.button("End all", on_click=end_all).props("flat dense").mark("end-claude-chats")
 
 
 # ---- First-run setup -------------------------------------------------------------------

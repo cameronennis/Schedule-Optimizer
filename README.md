@@ -25,7 +25,7 @@ Without an API key or Claude Desktop, the app is 100% functional, offline too. C
 
 **API key** (billed per use): paste a key from the Claude Console; it's stored in the OS keychain. Chat in the Claude tab, with a monthly spending cap. Claude can only propose; you click **Apply**.
 
-**Claude Desktop** (uses your Claude plan): click **Add it for me** (it saves a copy of Claude Desktop's config first, so **Undo** restores it), then fully quit and reopen Claude Desktop. Manual steps are under "Set it up manually instead." It works only in chats you activate: **Start a Claude chat** copies `ACTIVATE SCHEDULE OPTIMIZER FOR THIS CHAT (code …)` to paste as a chat's first message; codes last 12 hours and can be ended in Preferences. Tools: `get_plan`, `get_tasks`, `create_task`, `propose_changes`, `apply_changes`, `solve`, `explain_block`. New plans still need **Approve plan** in the app.
+**Claude Desktop** (uses your Claude plan): click **Add it for me** (it saves a copy of Claude Desktop's config first, so **Undo** restores it), then fully quit and reopen Claude Desktop. Manual steps are under "Set it up manually instead." It works only in chats you activate: **Start a Claude chat** copies `ACTIVATE SCHEDULE OPTIMIZER FOR THIS CHAT (code …)` to paste as a chat's first message; a code works until you end it in Preferences, which lists active chats so you can end them one at a time. Tools: `get_plan`, `get_tasks`, `create_task`, `propose_changes`, `apply_changes`, `solve`, `explain_block`. New plans still need **Approve plan** in the app.
 
 ## Command line
 

@@ -20,15 +20,15 @@ from pathlib import Path
 
 from sqlmodel import Session
 
-from . import db, store
-from .domain import EventInput, Plan
+from . import db, fmt, store
+from .domain import EventInput, Plan, skip_for_short
 from .tables import EffortMode, Proposal, ProposalStatus, Task, TaskStatus
 
 TASK_FIELDS = {
     "title": {"type": "string"},
     "hours": {"type": "number", "description": "Total work for a one-off task."},
     "weekly_hours": {"type": "number", "description": "Hours per week for a recurring intention (no deadline)."},
-    "priority": {"type": "integer", "minimum": 1, "maximum": 5, "description": "1 low … 5 top (2–10 points/hour)."},
+    "priority": {"type": "integer", "minimum": 1, "maximum": 5, "description": "1 top … 5 low (10–2 points/hour)."},
     "deadline": {"type": "string", "description": "ISO date or datetime, local time if no offset. A bare date means end of that day."},
     "earliest_start": {"type": "string", "description": "ISO date or datetime."},
     "min_block": {"type": "integer", "description": "Shortest block, minutes."},
@@ -50,9 +50,10 @@ CHANGE_SCHEMA = {
                 "create_task: TASK fields (title and hours or weekly_hours required). "
                 "update_task: task_id + any TASK fields, or status (active/paused/done). "
                 "delete_task: task_id. log_progress: task_id, minutes. "
-                "set_event: event_id, skippable, skip_cost (points; one top-priority hour = 10). "
-                "add_title_rule: pattern, skippable, skip_cost. delete_title_rule: rule_id. "
-                "update_preferences: awake_start/awake_end (HH:MM), max_focus_hours, buffer_minutes, horizon_days. "
+                "set_event: event_id, skippable, skip_for (1–5: the event may be skipped only to make room "
+                "for work of priority 1 through skip_for; 5 = any work). "
+                "add_title_rule: pattern, skippable, skip_for. delete_title_rule: rule_id. "
+                "update_preferences: awake_start/awake_end (HH:MM, 24-hour), max_focus_hours, buffer_minutes, horizon_days. "
                 "add_hold: title, start, end (time set aside, e.g. a break; goes on the Optimizer calendar when approved). delete_hold: hold_id."
             ),
         },
@@ -61,7 +62,8 @@ CHANGE_SCHEMA = {
         "minutes": {"type": "integer"},
         "event_id": {"type": "string"},
         "skippable": {"type": "boolean"},
-        "skip_cost": {"type": "number"},
+        "skip_for": {"type": "integer", "minimum": 1, "maximum": 5,
+                     "description": "Skippable events: priorities 1..skip_for may take its place (5 = any)."},
         "pattern": {"type": "string"},
         "rule_id": {"type": "integer"},
         "hold_id": {"type": "integer"},
@@ -155,16 +157,14 @@ def apply_change(s: Session, change: dict, now: datetime) -> str:
         if not event_id:
             raise ValueError("set_event needs event_id")
         skippable = bool(change.get("skippable"))
-        cost = float(change.get("skip_cost", 4.0))
-        if cost < 0:
-            raise ValueError("skip_cost can't be negative")
-        store.set_event_meta(s, event_id, skippable, cost)
-        return f"Event {event_id}: " + (f"skippable, cost {cost:g}" if skippable else "fixed")
+        skip_for = int(change.get("skip_for") or 2)
+        store.set_event_meta(s, event_id, skippable, skip_for)
+        return f"Event {event_id}: " + (f"skippable for {skip_for_short(skip_for)} work" if skippable else "fixed")
     if op == "add_title_rule":
         rule = store.add_title_rule(s, change.get("pattern", ""), bool(change.get("skippable", True)),
-                                    float(change.get("skip_cost", 4.0)))
-        return f"Rule: titles containing “{rule.pattern}” are " + (
-            f"skippable, cost {rule.skip_cost:g}" if rule.skippable else "fixed")
+                                    int(change.get("skip_for") or 2))
+        return f"Rule: events titled “{rule.pattern}” are " + (
+            f"skippable for {skip_for_short(rule.skip_for)} work" if rule.skippable else "fixed")
     if op == "delete_title_rule":
         store.delete_title_rule(s, int(change.get("rule_id")))
         return f"Deleted title rule {change.get('rule_id')}"
@@ -186,7 +186,7 @@ def apply_change(s: Session, change: dict, now: datetime) -> str:
         start, end = parse_dt(change.get("start", ""), tz), parse_dt(change.get("end", ""), tz)
         hold = store.add_hold(s, change.get("title") or "Hold", start, end)
         st, en = hold.start.astimezone(tz), hold.end.astimezone(tz)
-        return f"Hold “{hold.title}” {st:%a %H:%M}–{en:%H:%M}"
+        return f"Hold “{hold.title}” {fmt.day(st)}, {fmt.span(st, en)}"
     if op == "delete_hold":
         store.delete_hold(s, int(change.get("hold_id")))
         return f"Removed hold {change.get('hold_id')}"
@@ -229,7 +229,8 @@ def plan_summary(s: Session, plan: Plan, now: datetime, max_blocks: int = 40) ->
         "status": plan.status,
         "optimal": plan.status == "OPTIMAL",
         "unmet": {title(k): v for k, v in plan.unmet_minutes.items()},
-        "skipped_events": [f"{e.title} ({e.start.astimezone(tz):%a %H:%M}, cost {e.skip_cost:g})"
+        "skipped_events": [f"{e.title} ({fmt.when(e.start.astimezone(tz))}, skippable for "
+                           f"{skip_for_short(e.skip_for or 5)} work)"
                            for e in plan.skipped],
         "planned_minutes": sum(b.minutes for b in plan.blocks),
         "blocks": [{"task": b.title, "start": b.start.astimezone(tz).isoformat(timespec="minutes"),

@@ -55,7 +55,7 @@ def check_invariants(plan: Plan, tasks, events, prefs: Preferences):
         assert minutes <= prefs.max_focus_minutes_per_day
 
 
-@pytest.mark.parametrize("priority, attends", [(3, True), (5, False)])
+@pytest.mark.parametrize("priority, attends", [(3, True), (1, False)])
 def test_midterm_checkpoint(priority, attends):
     tasks, events, prefs, weekly = scenario(midterm_priority=priority)
     plan = solve(tasks, events, prefs, NOW, weekly=weekly)
@@ -65,7 +65,7 @@ def test_midterm_checkpoint(priority, attends):
 
 
 def test_plenty_of_time_keeps_lecture_even_at_top_priority():
-    tasks, events, prefs, weekly = scenario(midterm_priority=5)
+    tasks, events, prefs, weekly = scenario(midterm_priority=1)
     tasks[0].remaining_minutes = 60
     plan = solve(tasks, events, prefs, NOW, weekly=weekly)
     check_invariants(plan, tasks, events, prefs)
@@ -152,7 +152,7 @@ def test_short_event_between_blocks_counts_as_the_break():
 
 def test_short_event_never_overlapped_even_under_pressure():
     events = [EventInput(f"e{i}", "Check-in", at(18, 8 + i, 0), at(18, 8 + i, 15)) for i in range(1, 3)]
-    tasks = [TaskInput("t", "Report", remaining_minutes=300, priority=5, deadline=at(18, 11))]
+    tasks = [TaskInput("t", "Report", remaining_minutes=300, priority=1, deadline=at(18, 11))]
     plan = solve(tasks, events, SHORT_DAY, NOW)
     check_invariants(plan, tasks, events, SHORT_DAY)
     for b in plan.blocks:
@@ -163,7 +163,7 @@ def test_short_event_never_overlapped_even_under_pressure():
 def test_skipped_short_event_is_not_a_break():
     """If the short event is skipped, its time is free, so blocks around it merge."""
     cheap = EventInput("c", "Optional sync", at(18, 9, 30), at(18, 9, 40), skippable=True, skip_cost=0.1)
-    tasks = [TaskInput("t", "Report", remaining_minutes=180, priority=5, deadline=at(18, 11))]
+    tasks = [TaskInput("t", "Report", remaining_minutes=180, priority=1, deadline=at(18, 11))]
     plan = solve(tasks, [cheap], SHORT_DAY, NOW)
     check_invariants(plan, tasks, [cheap], SHORT_DAY)
     assert [e.attend for e in plan.events] == [False]

@@ -14,7 +14,7 @@ A local desktop app that reads Google Calendar, takes tasks with weights, and us
 - Python 3.12, uv, NiceGUI in native mode (pywebview), SQLite via SQLModel, OR-Tools CP-SAT, google-api-python-client + google-auth-oauthlib, keyring, httpx, APScheduler, pytest, PyInstaller.
 - Time unit = 5 minutes (integers). A 7-day horizon is 2,016 units.
 - `AddNoOverlap` across all intervals, padded by a 5-minute buffer.
-- All weights are in points per hour, so skip costs and priorities are comparable.
+- All weights are in points per hour, so skip costs and priorities are comparable. Priority 1 is top (10 points/hour) and 5 is low (2 points/hour).
 - Most rules are soft with large penalties. True infeasibility is diagnosed with assumption literals and `SufficientAssumptionsForInfeasibility()`.
 - Re-planning ("what now?") adds a small penalty for moving blocks, so the plan doesn't reshuffle after every progress log.
 - The app writes only to its own "Optimizer" Google calendar, never to real ones.
@@ -23,7 +23,8 @@ A local desktop app that reads Google Calendar, takes tasks with weights, and us
 - Completed tasks are deleted 7 days after they're marked done.
 - Plan blocks are written to the Optimizer calendar only after I click "Approve plan."
 - Preferences (awake window 8:00–23:00, 6 h max focus/day, 5-min buffer, 7-day horizon) have defaults but are editable in a first-run setup step and in Preferences.
-- Event title rules (e.g., "Lecture" → skippable, cost 4) have no built-in defaults. I create them by manual entry or through Claude.
+- Event rules (e.g., "Lecture" → skippable for priority 1–2) have no built-in defaults. I create them by manual entry or through Claude.
+- Skippable events use a priority threshold (`skip_for` 1–5, 5 = any work), not a point cost. Work below the threshold can never use the event's time (a hard rule in the solver); allowed work pays a skip cost of (value of priority skip_for − 1) points per hour of the event, so it skips only when the work can't fit elsewhere. Claude picks the threshold or asks me in plain words when unclear.
 - No phone access and no hosted version.
 - Google OAuth client file lives at `Secrets/client_secret.json` (capital S, gitignored). Never print or commit it.
 - A task's longest block (max_block) is soft: exceeding it costs 0.5 points per extra hour, less than any task's value, so deadlines and avoiding skips win. Blocks of the same task need at least 30 minutes between them (otherwise it's one longer block), as a fixed rule, not a preference.

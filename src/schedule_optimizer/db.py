@@ -67,7 +67,23 @@ def _v6_to_v7(conn) -> None:
         conn.execute(text("ALTER TABLE chatcode ADD COLUMN last_used_at DATETIME"))
 
 
-MIGRATIONS: list[Callable] = [_v1_to_v2, _v2_to_v3, _v3_to_v4, _v4_to_v5, _v5_to_v6, _v6_to_v7]
+def _v7_to_v8(conn) -> None:
+    """Priority is flipped: 1 is now top and 5 low, so existing tasks keep their meaning."""
+    conn.execute(text("UPDATE task SET priority = 6 - priority"))
+
+
+def _v8_to_v9(conn) -> None:
+    """Skippable events name a priority threshold instead of a point cost. Old costs aren't
+    converted: skippable settings and rules are removed, so those events are fixed again."""
+    for table in ("eventmeta", "titlerule"):
+        columns = {r[1] for r in conn.execute(text(f"PRAGMA table_info({table})"))}
+        if "skip_for" not in columns:
+            conn.execute(text(f"ALTER TABLE {table} ADD COLUMN skip_for INTEGER NOT NULL DEFAULT 2"))
+    conn.execute(text("DELETE FROM eventmeta WHERE skippable = 1"))
+    conn.execute(text("DELETE FROM titlerule WHERE skippable = 1"))
+
+
+MIGRATIONS: list[Callable] = [_v1_to_v2, _v2_to_v3, _v3_to_v4, _v4_to_v5, _v5_to_v6, _v6_to_v7, _v7_to_v8, _v8_to_v9]
 SCHEMA_VERSION = 1 + len(MIGRATIONS)
 
 

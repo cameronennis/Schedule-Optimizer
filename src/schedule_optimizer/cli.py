@@ -1,12 +1,12 @@
 """Command-line interface to the scheduler's data (Phase 4; the window comes in Phase 5).
 
-    uv run schedule-optimizer task add "Chem midterm" --hours 8 --due "2026-11-19 09:00" --priority 5
+    uv run schedule-optimizer task add "Chem midterm" --hours 8 --due "2026-11-19 09:00" --priority 1
     uv run schedule-optimizer task add "Reading" --weekly-hours 3 --when evening
     uv run schedule-optimizer task list
     uv run schedule-optimizer log 1 45                 # 45 minutes on task 1, ending now
-    uv run schedule-optimizer rule add Lecture --cost 4
+    uv run schedule-optimizer rule add Lecture --skip-for 2
     uv run schedule-optimizer events                   # upcoming events and how they're treated
-    uv run schedule-optimizer event set <id> --skippable --cost 8
+    uv run schedule-optimizer event set <id> --skippable --skip-for 1
     uv run schedule-optimizer plan                     # solve with your real calendar
     uv run schedule-optimizer approve              # also writes to your Optimizer calendar
     uv run schedule-optimizer prefs show
@@ -24,24 +24,31 @@ from . import db, store
 from .calendar_cli import pick_calendars
 from . import google_auth, optimizer_cal
 from .calendar_sync import busy_events, connect
+from . import fmt
 from .demo import print_plan
+from .domain import skip_for_short
 from .domain import TimeOfDay
 from .tables import ClaudeMode, EffortMode, Task, TaskStatus
 
 
 def parse_when(text: str, tz, end_of_day: bool = False) -> datetime:
-    """'2026-11-19 09:00', '2026-11-19T09:00', or a date ('2026-11-19' = start, or end if end_of_day)."""
+    """'11-19-2026 9:00 AM', or a date alone ('11-19-2026' = start of day, or its end if end_of_day).
+    ISO forms like '2026-11-19 09:00' also work."""
     text = text.strip()
+    date_part, _, clock_part = text.partition(" ")
     try:
-        if len(text) == 10:
-            d = datetime.fromisoformat(text).date()
+        d = fmt.parse_date(date_part)
+        if not clock_part:
             if end_of_day:
                 d += timedelta(days=1)
             return datetime.combine(d, time(0), tzinfo=tz)
-        dt = datetime.fromisoformat(text.replace(" ", "T"))
+        return datetime.combine(d, fmt.parse_clock(clock_part), tzinfo=tz)
     except ValueError:
-        raise SystemExit(f"Couldn't read the date/time {text!r}; use YYYY-MM-DD or 'YYYY-MM-DD HH:MM'.")
-    return dt if dt.tzinfo else dt.replace(tzinfo=tz)
+        try:
+            dt = datetime.fromisoformat(text.replace(" ", "T"))
+        except ValueError:
+            raise SystemExit(f"Couldn't read the date/time {text!r}; use '11-19-2026' or '11-19-2026 9:00 AM'.")
+        return dt if dt.tzinfo else dt.replace(tzinfo=tz)
 
 
 def fmt_minutes(m: int) -> str:
@@ -83,13 +90,13 @@ def print_tasks(s, tasks: list[Task], tz) -> None:
         print("No tasks yet. Add one with: schedule-optimizer task add \"Title\" --hours 2")
         return
     now = datetime.now(tz)
-    print(f"{'id':>3}  {'title':<28} {'pri':>3}  {'left':>11}  {'due':<16} {'blocks':<11} {'when':<9} status")
+    print(f"{'id':>3}  {'title':<28} {'pri':>3}  {'left':>11}  {'due':<23} {'blocks':<11} {'when':<9} status")
     for t in tasks:
         left = store.remaining_minutes(s, t, now, tz)
         amount = f"{fmt_minutes(left)}/wk" if t.effort_mode == EffortMode.WEEKLY else fmt_minutes(left)
-        due = t.deadline.astimezone(tz).strftime("%a %b %d %H:%M") if t.deadline else "-"
+        due = fmt.deadline(t.deadline.astimezone(tz)) if t.deadline else "-"
         blocks = f"{t.min_block}/{t.ideal_block}/{t.max_block}"
-        print(f"{t.id:>3}  {t.title[:28]:<28} {t.priority:>3}  {amount:>11}  {due:<16} {blocks:<11} "
+        print(f"{t.id:>3}  {t.title[:28]:<28} {t.priority:>3}  {amount:>11}  {due:<23} {blocks:<11} "
               f"{t.time_of_day.value:<9} {t.status.value}")
 
 
@@ -125,15 +132,16 @@ def cmd_log(args, s, tz):
 
 def cmd_rule(args, s, tz):
     if args.action == "add":
-        r = store.add_title_rule(s, args.pattern, skippable=not args.fixed, skip_cost=args.cost)
+        r = store.add_title_rule(s, args.pattern, skippable=not args.fixed, skip_for=args.skip_for)
         print(f"Rule {r.id}: titles containing “{r.pattern}” → "
-              + (f"skippable, cost {r.skip_cost:g}" if r.skippable else "fixed"))
+              + (f"skippable for {skip_for_short(r.skip_for)} work" if r.skippable else "fixed"))
     elif args.action == "list":
         rules = store.list_title_rules(s)
         if not rules:
-            print("No title rules. Add one with: schedule-optimizer rule add Lecture --cost 4")
+            print("No event rules. Add one with: schedule-optimizer rule add Lecture --skip-for 2")
         for r in rules:
-            print(f"{r.id:>3}  “{r.pattern}” → " + (f"skippable, cost {r.skip_cost:g}" if r.skippable else "fixed"))
+            print(f"{r.id:>3}  “{r.pattern}” → "
+                  + (f"skippable for {skip_for_short(r.skip_for)} work" if r.skippable else "fixed"))
     elif args.action == "rm":
         store.delete_title_rule(s, args.id)
         print(f"Rule {args.id} deleted.")
@@ -147,14 +155,15 @@ def cmd_events(args, s, tz):
         st, en = e.start.astimezone(tz), e.end.astimezone(tz)
         if st.date() != day:
             day = st.date()
-            print(st.strftime("%A %b %d"))
-        how = f"skippable ({e.skip_cost:g})" if e.skippable else "fixed"
-        print(f"  {st:%H:%M}–{en:%H:%M}  {e.title[:40]:<40} {how:<16} {e.id}")
+            print(fmt.day(st))
+        how = f"skip for {skip_for_short(e.skip_for)}" if e.skippable else "fixed"
+        print(f"  {fmt.span(st, en):<18}  {e.title[:40]:<40} {how:<22} {e.id}")
 
 
 def cmd_event(args, s, tz):
-    m = store.set_event_meta(s, args.event_id, skippable=args.skippable, skip_cost=args.cost)
-    print(f"Event {m.google_event_id}: " + (f"skippable, cost {m.skip_cost:g}" if m.skippable else "fixed"))
+    m = store.set_event_meta(s, args.event_id, skippable=args.skippable, skip_for=args.skip_for)
+    print(f"Event {m.google_event_id}: "
+          + (f"skippable for {skip_for_short(m.skip_for)} work" if m.skippable else "fixed"))
 
 
 # ---- planning ----------------------------------------------------------------------
@@ -250,8 +259,8 @@ def _task_options(p, adding: bool):
     amount.add_argument("--hours", type=float, help="total hours of work")
     amount.add_argument("--minutes", type=int, help="total minutes of work")
     amount.add_argument("--weekly-hours", type=float, help="hours per week (resets Monday)")
-    p.add_argument("--priority", type=int, choices=range(1, 6))
-    p.add_argument("--due", help="deadline: 'YYYY-MM-DD HH:MM' or a date (end of that day); 'none' clears")
+    p.add_argument("--priority", type=int, choices=range(1, 6), help="1 = top … 5 = low")
+    p.add_argument("--due", help="deadline: '11-19-2026 9:00 AM' or a date (end of that day); 'none' clears")
     p.add_argument("--start", help="earliest start, same format; 'none' clears")
     p.add_argument("--min", dest="min_block", type=int, help="shortest block, minutes")
     p.add_argument("--ideal", dest="ideal_block", type=int, help="ideal block, minutes")
@@ -283,7 +292,8 @@ def build_parser() -> argparse.ArgumentParser:
     rsub = rule.add_subparsers(dest="action", required=True)
     radd = rsub.add_parser("add")
     radd.add_argument("pattern", help="text the title contains (case-insensitive)")
-    radd.add_argument("--cost", type=float, default=4.0, help="skip cost in points")
+    radd.add_argument("--skip-for", type=int, default=2, choices=range(1, 6),
+                      help="may be skipped for priority 1 through this (5 = any work); default 2")
     radd.add_argument("--fixed", action="store_true", help="mark matching events not skippable")
     rsub.add_parser("list")
     rsub.add_parser("rm").add_argument("id", type=int)
@@ -296,7 +306,8 @@ def build_parser() -> argparse.ArgumentParser:
     group = eset.add_mutually_exclusive_group(required=True)
     group.add_argument("--skippable", action="store_true")
     group.add_argument("--fixed", action="store_true")
-    eset.add_argument("--cost", type=float, default=4.0)
+    eset.add_argument("--skip-for", type=int, default=2, choices=range(1, 6),
+                      help="may be skipped for priority 1 through this (5 = any work)")
 
     plan = sub.add_parser("plan", help="solve and show a proposed plan")
     plan.add_argument("--offline", action="store_true", help="ignore Google Calendar")

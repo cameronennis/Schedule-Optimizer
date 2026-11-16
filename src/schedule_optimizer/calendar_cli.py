@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timedelta
 
+from . import fmt
 from . import db, google_auth, store
 from .calendar_sync import busy_events
 from .demo import print_plan
@@ -41,11 +42,11 @@ def pick_calendars(calendars: list[CalendarInfo]) -> list[str]:
 def sample_tasks(now: datetime):
     return (
         [
-            TaskInput("sample-study", "Sample: exam study", remaining_minutes=6 * 60, priority=4,
+            TaskInput("sample-study", "Sample: exam study", remaining_minutes=6 * 60, priority=2,
                       deadline=now + timedelta(days=3)),
             TaskInput("sample-project", "Sample: project work", remaining_minutes=4 * 60, priority=3),
         ],
-        [WeeklyTask("sample-reading", "Sample: reading", weekly_minutes=2 * 60, priority=2,
+        [WeeklyTask("sample-reading", "Sample: reading", weekly_minutes=2 * 60, priority=4,
                     time_of_day=TimeOfDay.EVENING)],
     )
 
@@ -83,8 +84,8 @@ def main() -> None:
         s, t = e.start.astimezone(tz), e.end.astimezone(tz)
         if s.date() != day:
             day = s.date()
-            print(s.strftime("%A %b %d"))
-        print(f"  {s:%H:%M}–{t:%H:%M}  {e.title}")
+            print(fmt.day(s))
+        print(f"  {fmt.span(s, t):<18}  {e.title}")
 
     if args.solve:
         tasks, weekly = sample_tasks(now)

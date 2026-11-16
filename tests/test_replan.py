@@ -166,7 +166,7 @@ def test_replan_keeps_blocks_in_place_after_logging_progress():
     """Phase 6 checkpoint, in the solver: log 30 min, re-plan, and most blocks stay put."""
     prefs = Preferences(horizon_days=4)
     tasks = [TaskInput("1", "Essay", remaining_minutes=6 * 60, priority=3, deadline=at(21, 23)),
-             TaskInput("2", "Problem set", remaining_minutes=4 * 60, priority=4, deadline=at(20, 17))]
+             TaskInput("2", "Problem set", remaining_minutes=4 * 60, priority=2, deadline=at(20, 17))]
     first = solve(tasks, [], prefs, NOW)
     previous = {}
     for b in first.blocks:
@@ -224,7 +224,7 @@ def test_phase4_database_upgrades_to_latest(tmp_path):
         assert p.stability_per_hour == 1.0 and p.optimizer_calendar_id is None
         assert p.claude_monthly_cap_usd == 5.0 and store.list_holds(session) == []
     eng.dispose()
-    assert sqlite3.connect(path).execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION == 7
+    assert sqlite3.connect(path).execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION == 9
 
 
 # ---- Optimizer calendar sync ---------------------------------------------------------
@@ -366,7 +366,7 @@ def test_block_under_way_at_replan_is_cut_off_not_left_behind(s):
 
     mid = old.start + timedelta(minutes=40)  # re-plan 40 minutes into the block
     # Something urgent has to go first, so the PSET block doesn't continue right away.
-    store.add_task(s, title="Catchup", total_minutes=60, priority=5, deadline=mid + timedelta(minutes=70))
+    store.add_task(s, title="Catchup", total_minutes=60, priority=1, deadline=mid + timedelta(minutes=70))
     store.plan_now(s, [], mid)
     optimizer_cal.approve_and_sync(s, fake, mid)
 
@@ -405,7 +405,7 @@ def test_replan_after_replan_leaves_only_the_latest(s):
     store.add_task(s, title="A", total_minutes=90, deadline=at(19, 23))
     for minutes in (0, 50, 130):  # three re-plans, each approved
         now = NOW + timedelta(minutes=minutes)
-        store.add_task(s, title=f"New {minutes}", total_minutes=60, priority=5, deadline=at(18, 23))
+        store.add_task(s, title=f"New {minutes}", total_minutes=60, priority=1, deadline=at(18, 23))
         store.plan_now(s, [], now)
         optimizer_cal.approve_and_sync(s, fake, now)
     cal_id = store.get_prefs(s).optimizer_calendar_id
@@ -420,7 +420,7 @@ def test_same_task_continuing_merges_into_one_block(s):
     """Regression: re-planning 4 minutes into a block left a 5-minute sliver next to the
     same task's new block. If the plan continues the same task, it's one block."""
     fake = FakeCalendar()
-    store.add_task(s, title="Catchup", total_minutes=60, priority=5, deadline=at(18, 12))
+    store.add_task(s, title="Catchup", total_minutes=60, priority=1, deadline=at(18, 12))
     store.plan_now(s, [], NOW)
     optimizer_cal.approve_and_sync(s, fake, NOW)
     [old] = store.approved_blocks(s, NOW)
@@ -440,7 +440,7 @@ def test_short_sliver_of_a_replaced_block_is_dropped(s):
     optimizer_cal.approve_and_sync(s, fake, NOW)
     [old] = store.approved_blocks(s, NOW)
     mid = old.start + timedelta(minutes=4)
-    store.add_task(s, title="Urgent", total_minutes=60, priority=5, deadline=mid + timedelta(minutes=70))
+    store.add_task(s, title="Urgent", total_minutes=60, priority=1, deadline=mid + timedelta(minutes=70))
     store.plan_now(s, [], mid)
     optimizer_cal.approve_and_sync(s, fake, mid)
     events = fake.optimizer_events(store.get_prefs(s).optimizer_calendar_id)
@@ -453,7 +453,7 @@ def test_block_that_just_ended_merges_with_the_same_task_continuing(s):
     """Regression: a Catchup block ended at 20:20, you re-planned at 20:23 with 15 min left,
     and the plan added a separate 20:25–20:40 slice instead of extending the block."""
     fake = FakeCalendar()
-    t = store.add_task(s, title="Catchup", total_minutes=60, priority=5, deadline=at(18, 12))
+    t = store.add_task(s, title="Catchup", total_minutes=60, priority=1, deadline=at(18, 12))
     store.plan_now(s, [], NOW)
     optimizer_cal.approve_and_sync(s, fake, NOW)
     [old] = store.approved_blocks(s, NOW)
@@ -473,7 +473,7 @@ def test_block_that_just_ended_merges_with_the_same_task_continuing(s):
 
 def test_block_that_ended_long_ago_is_left_alone(s):
     fake = FakeCalendar()
-    t = store.add_task(s, title="Catchup", total_minutes=120, priority=5, deadline=at(19, 12))
+    t = store.add_task(s, title="Catchup", total_minutes=120, priority=1, deadline=at(19, 12))
     store.plan_now(s, [], NOW)
     optimizer_cal.approve_and_sync(s, fake, NOW)
     first = store.approved_blocks(s, NOW)[0]

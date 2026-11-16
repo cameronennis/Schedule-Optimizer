@@ -9,15 +9,17 @@ the window stays responsive.
 
 from __future__ import annotations
 
+import asyncio
 import sys
 from datetime import datetime, time, timedelta
 from pathlib import Path
 
 from nicegui import run, ui
 
-from . import changes, claude_api, claude_tools, clipboard, db, desktop_setup, google_auth, optimizer_cal, store
+from . import (changes, claude_api, claude_tools, clipboard, db, desktop_setup, fmt, google_auth,
+               optimizer_cal, store, theme)
 from .calendar_sync import CalendarsNotChosen, busy_events, busy_events_if_connected, connect
-from .domain import EventInput, Plan, TimeOfDay
+from .domain import SKIP_FOR_CHOICES, EventInput, Plan, TimeOfDay, skip_for_short
 from .gcal import list_calendars
 from .tables import EffortMode, Task, TaskStatus
 
@@ -26,7 +28,13 @@ from .tables import EffortMode, Task, TaskStatus
 STATE: dict = {"plan": None, "events": [], "error": None, "solved_at": None}
 CHAT = claude_api.Chat()  # API-key mode conversation, kept until "New chat"
 
-PRIORITY_LABELS = {1: "1 · low", 2: "2", 3: "3 · normal", 4: "4", 5: "5 · top"}
+PRIORITY_LABELS = {1: "1 · top", 2: "2", 3: "3 · normal", 4: "4", 5: "5 · low"}
+SKIP_FOR_HELP = ("Choose which task priority makes skipping worth it. With “priority 1–2,” the planner skips "
+                 "only when that's the only way to fit priority 1 or 2 work.")
+EVENT_RULES_HELP = ("Name events that are skippable instead of being hard blocks in your schedule. For example, "
+                    "give “Lecture” the rule “priority 1–2.” When a priority 1 or 2 task can't fit before its "
+                    "deadline any other way, the planner may place the task during the lecture. The planner won't "
+                    "skip it for priority 3–5 tasks. You can also set the rule per-entry in Upcoming Events.")
 WHEN_LABELS = {t.value: t.value.capitalize() for t in TimeOfDay}
 
 
@@ -48,29 +56,36 @@ def notify_error(e: Exception) -> None:
 # ---- small reusable inputs -------------------------------------------------------------
 
 
+def _time_menu(field) -> None:
+    """A scrollable list of times (every 15 minutes) under a time field, instead of a clock face."""
+    with field, ui.menu().props("no-parent-event max-height=260px fit") as menu:  # anchored to the field
+        for label in fmt.time_options():
+            ui.item(label, on_click=lambda v=label: (field.set_value(v), menu.close())).props("dense")
+    with field.add_slot("append"):
+        ui.icon("schedule").on("click", menu.open).classes("cursor-pointer")
+
+
 class DateTimeInput:
-    """A date picker + time picker pair that yields an aware datetime (or None).
+    """A date field (MM-DD-YYYY, with a calendar) and a time field (9:30 AM, with a list).
 
     With no time entered, a deadline means the end of that day and a start means its beginning.
     """
 
     def __init__(self, label: str, value: datetime | None, zone, end_of_day: bool, marker: str):
         self.zone, self.end_of_day = zone, end_of_day
-        default_time = time(0)
         local = value.astimezone(zone) if value else None
         with ui.row().classes("items-center gap-2 no-wrap"):
-            with ui.input(f"{label} date", value=local.strftime("%Y-%m-%d") if local else "",
-                          placeholder="YYYY-MM-DD").classes("w-40").mark(f"{marker}-date") as self.date:
+            with ui.input(f"{label} date", value=fmt.date_text(local) if local else "",
+                          placeholder="MM-DD-YYYY").props("stack-label").classes("w-40") \
+                    .mark(f"{marker}-date") as self.date:
                 with ui.menu().props("no-parent-event") as menu:
-                    ui.date(mask="YYYY-MM-DD").bind_value(self.date)
+                    ui.date(mask="MM-DD-YYYY").bind_value(self.date)
                 with self.date.add_slot("append"):
                     ui.icon("edit_calendar").on("click", menu.open).classes("cursor-pointer")
-            with ui.input("Time", value=local.strftime("%H:%M") if local else "",
-                          placeholder="end of day" if end_of_day else "00:00").classes("w-28").mark(f"{marker}-time") as self.time:
-                with ui.menu().props("no-parent-event") as tmenu:
-                    ui.time(mask="HH:mm").bind_value(self.time)
-                with self.time.add_slot("append"):
-                    ui.icon("schedule").on("click", tmenu.open).classes("cursor-pointer")
+            self.time = ui.input("Time", value=fmt.clock(local) if local else "",
+                                 placeholder="end of day" if end_of_day else "start of day") \
+                .props("stack-label").classes("w-32").mark(f"{marker}-time")
+            _time_menu(self.time)
             ui.button(icon="close", on_click=lambda: (self.date.set_value(""), self.time.set_value(""))) \
                 .props("flat dense round").tooltip("Clear")
 
@@ -78,31 +93,22 @@ class DateTimeInput:
         d = (self.date.value or "").strip()
         if not d:
             return None
-        try:
-            day = datetime.strptime(d, "%Y-%m-%d").date()
-            t = (self.time.value or "").strip()
-            clock = datetime.strptime(t, "%H:%M").time() if t else time(0)
-        except ValueError:
-            raise ValueError("Dates look like 2026-11-19 and times like 09:00.")
+        the_day = fmt.parse_date(d)
+        t = (self.time.value or "").strip()
+        clock = fmt.parse_clock(t) if t else time(0)
         if not t and self.end_of_day:
-            day += timedelta(days=1)  # midnight at the end of that day
-        return datetime.combine(day, clock, tzinfo=self.zone)
+            the_day += timedelta(days=1)  # midnight at the end of that day
+        return datetime.combine(the_day, clock, tzinfo=self.zone)
 
 
 def time_input(label: str, value: time, marker: str):
-    with ui.input(label, value=value.strftime("%H:%M")).classes("w-32").mark(marker) as inp:
-        with ui.menu().props("no-parent-event") as menu:
-            ui.time(mask="HH:mm").bind_value(inp)
-        with inp.add_slot("append"):
-            ui.icon("schedule").on("click", menu.open).classes("cursor-pointer")
+    inp = ui.input(label, value=fmt.clock(value)).classes("w-36").mark(marker)
+    _time_menu(inp)
     return inp
 
 
 def parse_clock(text: str) -> time:
-    try:
-        return time.fromisoformat((text or "").strip())
-    except ValueError:
-        raise ValueError(f"{text!r} isn't a time; use HH:MM, e.g. 08:00.")
+    return fmt.parse_clock(text)
 
 
 # ---- preferences form (used by setup and the Preferences tab) --------------------------
@@ -124,8 +130,8 @@ class PrefsForm:
                                      suffix="days").classes("w-36").mark("pref-horizon")
         self.weights = None
         if advanced:
-            with ui.expansion("Advanced: scoring weights (points)").classes("w-full"):
-                ui.label("Task value is 2 points per hour per priority level (priority 5 = 10 points/hour).") \
+            with ui.expansion("Advanced: Scoring Weights (Points)").classes("w-full"):
+                ui.label("Task value in points per hour: priority 1 = 10, 2 = 8, 3 = 6, 4 = 4, 5 = 2.") \
                     .classes("text-sm text-gray-500")
                 with ui.row().classes("gap-4"):
                     self.weights = {
@@ -304,7 +310,7 @@ def open_log_dialog(task_id: int | None = None) -> None:
         ui.notify("Add a task first.")
         return
     with ui.dialog() as dialog, ui.card().classes("w-96"):
-        ui.label("Log progress").classes("text-lg font-medium")
+        ui.label("Log Progress").classes("text-lg font-medium")
         task = ui.select({t.id: t.title for t in tasks}, label="Task",
                          value=task_id or tasks[0].id).classes("w-full").mark("log-task")
         minutes = ui.number("Minutes worked", value=30, min=5, step=5).classes("w-full").mark("log-minutes")
@@ -364,11 +370,12 @@ def now_view() -> None:
         if current:
             ui.label("Right now").classes("text-sm text-gray-500")
             ui.label(titles.get(current.task_id, "?")).classes("text-xl font-medium")
-            ui.label(f"until {current.end.astimezone(zone):%H:%M}")
+            ui.label(f"until {fmt.clock(current.end.astimezone(zone))}")
         elif upcoming:
             ui.label("Next up").classes("text-sm text-gray-500")
             ui.label(titles.get(upcoming.task_id, "?")).classes("text-xl font-medium")
-            ui.label(f"{upcoming.start.astimezone(zone):%a %H:%M}–{upcoming.end.astimezone(zone):%H:%M}")
+            ui.label(f"{fmt.day(upcoming.start.astimezone(zone))}, "
+                     f"{fmt.span(upcoming.start.astimezone(zone), upcoming.end.astimezone(zone))}")
         else:
             ui.label("Nothing planned yet. Add tasks, then press Re-plan.").classes("text-gray-500")
 
@@ -382,7 +389,7 @@ def now_view() -> None:
     if row:
         with ui.row().classes("gap-4 text-sm text-gray-600 items-center"):
             by = {"claude-desktop": " by Claude Desktop", "api": " by Claude"}.get(row.source, "")
-            ui.label(f"{row.objective_points:.1f} points · solved {row.solved_at.astimezone(zone):%a %H:%M}{by}")
+            ui.label(f"{row.objective_points:.1f} points · solved {fmt.when(row.solved_at.astimezone(zone))}{by}")
             if row.status == "OPTIMAL":
                 ui.badge("optimal", color="positive").tooltip("The solver proved no better plan exists")
             elif row.status == "FEASIBLE":
@@ -397,8 +404,8 @@ def now_view() -> None:
                 ui.badge(row.status.lower(), color="negative")
             for e in row.events:
                 if e["skippable"] and not e["attend"]:
-                    ui.label(f"Skips “{e['title']}” ({datetime.fromisoformat(e['start']).astimezone(zone):%a %H:%M}, "
-                             f"cost {e['skip_cost']:g})").classes("text-warning")
+                    ui.label(f"Skips “{e['title']}” ({fmt.when(datetime.fromisoformat(e['start']).astimezone(zone))}, "
+                             f"for {skip_for_short(e.get('skip_for') or 5)} work)").classes("text-warning")
         conflicts = {c["task_id"]: c for c in row.conflicts}
         for task_id, mins in row.unmet.items():
             name = titles.get(int(task_id.split("@")[0]), task_id)
@@ -414,7 +421,7 @@ def now_view() -> None:
     items = [("block", b.start, b.end, b) for b in blocks]
     items += [("event", e.start, e.end, e) for e in events]
     items.sort(key=lambda x: x[1])
-    status = "Proposed plan" if has_proposed else ("Approved plan" if blocks else ("Holds" if holds else ""))
+    status = "Proposed Plan" if has_proposed else ("Approved Plan" if blocks else ("Holds" if holds else ""))
     if status:
         ui.label(status).classes("text-lg font-medium mt-2")
     day = None
@@ -423,9 +430,9 @@ def now_view() -> None:
         s_local, e_local = start.astimezone(zone), end.astimezone(zone)
         if s_local.date() != day:
             day = s_local.date()
-            ui.label(s_local.strftime("%A, %B %d")).classes("font-medium mt-3")
+            ui.label(f"{s_local:%A, %B} {s_local.day}").classes("font-medium mt-3")
         with ui.row().classes("items-center gap-3 w-full pl-2"):
-            ui.label(f"{s_local:%H:%M}–{e_local:%H:%M}").classes("w-28 font-mono text-sm")
+            ui.label(fmt.span(s_local, e_local)).classes("w-40 font-mono text-sm")
             if kind == "block":
                 ui.icon("task_alt", color="primary")
                 ui.label(titles.get(obj.task_id, "?")).classes("font-medium")
@@ -441,7 +448,7 @@ def now_view() -> None:
                 ui.icon("event_busy" if obj.id in skipped else "event", color="grey")
                 ui.label(obj.title).classes("text-gray-500" + (" line-through" if obj.id in skipped else ""))
                 if obj.skippable:
-                    ui.badge("skipped" if obj.id in skipped else f"skippable · {obj.skip_cost:g}",
+                    ui.badge("skipped" if obj.id in skipped else f"skippable · {skip_for_short(obj.skip_for or 5)}",
                              color="orange" if obj.id in skipped else "grey")
 
 
@@ -596,14 +603,14 @@ def chat_view() -> None:
 
         ui.button("New chat", icon="refresh", on_click=new_chat).props("flat dense")
 
-    ui.separator().classes("my-4")
-    ui.label("Claude Desktop").classes("text-lg font-medium")
-    if desktop_setup.is_configured():
-        ui.label("Start a chat in Claude Desktop that can use Schedule Optimizer.").classes("text-sm text-gray-500")
-        ui.button("Start a Claude chat", icon="chat", on_click=start_claude_chat).mark("chat-tab-start")
-    else:
-        ui.label("Set up Claude Desktop in Preferences › Natural Language Input to use it with your Claude plan.") \
-            .classes("text-sm text-gray-500")
+    with ui.expansion("Claude Desktop Chat Input").classes("w-full text-sm text-gray-600 mt-4") \
+            .mark("claude-desktop-section"):
+        if desktop_setup.is_configured():
+            ui.label("Start a chat in Claude Desktop that can use Schedule Optimizer.").classes("text-sm text-gray-500")
+            ui.button("Start a Claude chat", icon="chat", on_click=start_claude_chat).mark("chat-tab-start")
+        else:
+            ui.label("Set up Claude Desktop in Preferences › Natural Language Input to use it with your Claude "
+                     "plan.").classes("text-sm text-gray-500")
 
 
 # ---- Tasks -----------------------------------------------------------------------------
@@ -613,7 +620,7 @@ def open_task_dialog(task: Task | None = None) -> None:
     zone = tz()
     t = task or Task(title="", total_minutes=60)
     with ui.dialog() as dialog, ui.card().classes("w-[36rem]"):
-        ui.label("Edit task" if task else "New task").classes("text-lg font-medium")
+        ui.label("Edit Task" if task else "New Task").classes("text-lg font-medium")
         title = ui.input("Title", value=t.title).classes("w-full").mark("task-title")
         mode = ui.toggle({"total": "Total amount", "weekly": "Per week"}, value=t.effort_mode.value) \
             .mark("task-mode")
@@ -625,7 +632,7 @@ def open_task_dialog(task: Task | None = None) -> None:
         with ui.column().classes("gap-0").bind_visibility_from(mode, "value", value="total"):
             deadline = DateTimeInput("Deadline", t.deadline, zone, True, "task-deadline")
         when = ui.select(WHEN_LABELS, label="Preferred time of day", value=t.time_of_day.value).classes("w-56")
-        with ui.expansion("More options").classes("w-full"):
+        with ui.expansion("More Options").classes("w-full"):
             start = DateTimeInput("Can't start before", t.earliest_start, zone, False, "task-start")
             with ui.row():
                 min_b = ui.number("Shortest block", value=t.min_block, min=5, step=5, suffix="min").classes("w-36")
@@ -680,14 +687,82 @@ def _task_action(task_id: int, action: str) -> None:
     tasks_view.refresh()
 
 
-def confirm_delete(t: Task) -> None:
-    with ui.dialog() as dialog, ui.card():
-        ui.label(f"Delete “{t.title}” and its logged progress?")
-        with ui.row().classes("w-full justify-end"):
-            ui.button("Cancel", on_click=dialog.close).props("flat")
-            ui.button("Delete", color="negative",
-                      on_click=lambda: (dialog.close(), _task_action(t.id, "delete"))).mark("confirm-delete")
-    dialog.open()
+UNDO_SECONDS = 10
+DONE_FLASH_SECONDS = 0.4  # matches the .done-flash animation in theme.py
+COLLAPSE_SECONDS = 0.25  # the card folding up afterward (theme.FOLD_JS)
+
+
+async def fold_away(card) -> None:
+    """Fold a card up smoothly; returns once it's flat, so removing it doesn't snap."""
+    ui.run_javascript(theme.FOLD_JS.format(id=card.id, ms=int(COLLAPSE_SECONDS * 1000)))
+    await asyncio.sleep(COLLAPSE_SECONDS + 0.03)
+TOAST_AREAS: dict[str, object] = {}  # client id → the page's popup area (outside any refreshable)
+
+
+def show_undo_toast(message: str, undo) -> None:
+    """A popup at the bottom with an Undo button, gone after UNDO_SECONDS (or a newer popup)."""
+    area = TOAST_AREAS.get(ui.context.client.id)
+    if area is None:
+        return
+    area.clear()
+    with area:
+        with ui.row().classes("undo-toast items-center gap-4 no-wrap").mark("undo-toast") as toast:
+            ui.label(message).mark("undo-message")
+
+            def do_undo() -> None:
+                area.clear()
+                undo()
+
+            ui.button("Undo", on_click=do_undo).props("flat dense").mark("undo-action")
+
+        def expire() -> None:
+            if not toast.is_deleted:
+                area.clear()
+
+        ui.timer(UNDO_SECONDS, expire, once=True)
+
+
+async def mark_done(task_id: int, card) -> None:
+    """A green glow and fade (0.4 s), then the task is marked done, with Undo."""
+    card.classes(add="done-flash")  # glow and fade
+    await asyncio.sleep(DONE_FLASH_SECONDS)
+    await fold_away(card)
+    with db.session() as s:
+        task = s.get(Task, task_id)
+        if task is None:
+            return
+        before, title = task.status, task.title
+    _task_action(task_id, "done")
+    now_view.refresh()
+
+    def undo() -> None:
+        with db.session() as s:
+            store.update_task(s, task_id, status=before)
+        tasks_view.refresh()
+        now_view.refresh()
+
+    show_undo_toast(f"Marked “{title}” done", undo)
+
+
+async def delete_task(task_id: int, card=None) -> None:
+    """Fold the card away, delete, and offer Undo in the popup."""
+    if card is not None:
+        await fold_away(card)
+    with db.session() as s:
+        try:
+            snap = store.delete_task_with_undo(s, task_id)
+        except KeyError:
+            return
+    tasks_view.refresh()
+    now_view.refresh()
+
+    def undo() -> None:
+        with db.session() as s:
+            store.restore_task(s, snap)
+        tasks_view.refresh()
+        now_view.refresh()
+
+    show_undo_toast(f"Deleted “{snap['task']['title']}”", undo)
 
 
 @ui.refreshable
@@ -705,36 +780,41 @@ def tasks_view() -> None:
         ui.label("No tasks yet. Add one to get started.").classes("text-gray-500 mt-4")
         return
     for t in tasks:
-        with ui.card().classes("w-full").mark(f"task-{t.id}"):
-            with ui.row().classes("items-center w-full no-wrap"):
-                with ui.column().classes("gap-0 grow"):
+        with ui.card().classes("w-full").mark(f"task-{t.id}") as card:
+            # Details on the left, actions on the right; on a phone-width window the actions move below
+            # (the .task-row rule in theme.py).
+            with ui.element("div").classes("task-row w-full"):
+                with ui.column().classes("gap-0 min-w-0").mark(f"details-{t.id}"):
                     ui.label(t.title).classes("text-base font-medium" + (" line-through" if t.status == TaskStatus.DONE else ""))
-                    bits = [f"Priority {t.priority}"]
+                    lines = [f"Priority {t.priority}"]
                     if t.effort_mode == EffortMode.WEEKLY:
-                        bits.append(f"{fmt_minutes(left[t.id])} left this week of {fmt_minutes(t.weekly_minutes or 0)}")
+                        lines.append(f"{fmt_minutes(left[t.id])} left this week")
                     else:
-                        bits.append(f"{fmt_minutes(left[t.id])} left of {fmt_minutes(t.total_minutes or 0)}")
+                        lines.append(f"{fmt_minutes(left[t.id])} left")
                     if t.deadline:
-                        bits.append(f"due {t.deadline.astimezone(zone):%a %b %d %H:%M}")
+                        lines.append(f"Due {fmt.deadline(t.deadline.astimezone(zone))}")
                     if t.time_of_day != TimeOfDay.ANY:
-                        bits.append(t.time_of_day.value)
+                        lines.append(f"Prefers {t.time_of_day.value}s")  # mornings, afternoons, evenings
                     if t.status != TaskStatus.ACTIVE:
-                        bits.append(t.status.value)
-                    ui.label(" · ".join(bits)).classes("text-sm text-gray-500")
-                ui.button(icon="timer", on_click=lambda tid=t.id: open_log_dialog(tid)).props("flat round") \
-                    .tooltip("Log progress")
-                ui.button(icon="edit", on_click=lambda task=t: open_task_dialog(task)).props("flat round") \
-                    .tooltip("Edit").mark(f"edit-{t.id}")
-                if t.status == TaskStatus.ACTIVE:
-                    ui.button(icon="pause", on_click=lambda tid=t.id: _task_action(tid, "pause")) \
-                        .props("flat round").tooltip("Pause")
-                    ui.button(icon="check", on_click=lambda tid=t.id: _task_action(tid, "done")) \
-                        .props("flat round").tooltip("Mark done").mark(f"done-{t.id}")
-                else:
-                    ui.button(icon="play_arrow", on_click=lambda tid=t.id: _task_action(tid, "resume")) \
-                        .props("flat round").tooltip("Make active again")
-                ui.button(icon="delete", on_click=lambda task=t: confirm_delete(task)).props("flat round") \
-                    .tooltip("Delete").mark(f"delete-{t.id}")
+                        lines.append(t.status.value.capitalize())
+                    for line in lines:
+                        ui.label(line).classes("text-sm text-gray-500 leading-snug")
+                with ui.row().classes("task-actions gap-0 no-wrap").mark(f"actions-{t.id}"):
+                    ui.button(icon="timer", on_click=lambda tid=t.id: open_log_dialog(tid)).props("flat round") \
+                        .tooltip("Log progress")
+                    ui.button(icon="edit", on_click=lambda task=t: open_task_dialog(task)).props("flat round") \
+                        .tooltip("Edit").mark(f"edit-{t.id}")
+                    if t.status == TaskStatus.ACTIVE:
+                        ui.button(icon="pause", on_click=lambda tid=t.id: _task_action(tid, "pause")) \
+                            .props("flat round").tooltip("Pause")
+                    else:
+                        ui.button(icon="play_arrow", on_click=lambda tid=t.id: _task_action(tid, "resume")) \
+                            .props("flat round").tooltip("Make active again")
+                    if t.status != TaskStatus.DONE:  # paused tasks can be finished too
+                        ui.button(icon="check", on_click=lambda tid=t.id, c=card: mark_done(tid, c)) \
+                            .props("flat round").tooltip("Mark done").mark(f"done-{t.id}")
+                    ui.button(icon="delete", on_click=lambda tid=t.id, c=card: delete_task(tid, c)) \
+                        .props("flat round").tooltip("Delete").mark(f"delete-{t.id}")
 
 
 # ---- Events ----------------------------------------------------------------------------
@@ -744,13 +824,12 @@ def tasks_view() -> None:
 def rules_view() -> None:
     with db.session() as s:
         rules = store.list_title_rules(s)
-    ui.label("Title rules").classes("text-lg font-medium")
-    ui.label("Events whose title contains the text start out with these settings. "
-             "Settings on a single event override its rule.").classes("text-sm text-gray-500")
+    ui.label(EVENT_RULES_HELP).classes("text-sm text-gray-600 font-normal")
     for r in rules:
         with ui.row().classes("items-center gap-3"):
             ui.label(f"“{r.pattern}”").classes("font-medium")
-            ui.label(f"skippable, cost {r.skip_cost:g} points" if r.skippable else "fixed").classes("text-gray-600")
+            ui.label(f"skippable for {skip_for_short(r.skip_for)}" if r.skippable else "fixed") \
+                .classes("text-gray-600 font-normal")
 
             def remove(rid=r.id):
                 with db.session() as s:
@@ -761,15 +840,15 @@ def rules_view() -> None:
             ui.button(icon="delete", on_click=remove).props("flat round dense").mark(f"rule-delete-{r.id}")
     with ui.row().classes("items-end gap-3"):
         pattern = ui.input("Title contains", placeholder="Lecture").classes("w-48").mark("rule-pattern")
-        skippable = ui.switch("Skippable", value=True)
-        cost = ui.number("Skip cost", value=4, min=0, step=1, suffix="pts").classes("w-32").mark("rule-cost") \
-            .bind_visibility_from(skippable, "value")
+        skippable = ui.switch("Skippable", value=True).classes("font-normal")
+        skip_for = ui.select(SKIP_FOR_CHOICES, label="Skip for", value=2).classes("w-48 font-normal") \
+            .mark("rule-skip-for").bind_visibility_from(skippable, "value")
 
         def add() -> None:
             try:
                 with db.session() as s:
                     store.add_title_rule(s, pattern.value or "", skippable=skippable.value,
-                                         skip_cost=float(cost.value or 0))
+                                         skip_for=int(skip_for.value or 2))
             except ValueError as e:
                 notify_error(e)
                 return
@@ -777,8 +856,6 @@ def rules_view() -> None:
             events_view.refresh()
 
         ui.button("Add rule", icon="add", on_click=add).mark("rule-add")
-    ui.label("A skip cost is in the same points as task value: priority 5 work earns 10 points per hour, "
-             "so a cost of 4 means “worth about 24 minutes of top-priority work.”").classes("text-sm text-gray-500")
 
 
 def _fetch_events() -> list[EventInput]:
@@ -789,7 +866,6 @@ def _fetch_events() -> list[EventInput]:
 
 @ui.refreshable
 def events_view() -> None:
-    ui.label("Upcoming events").classes("text-lg font-medium mt-4")
     load_later(_events_view)
 
 
@@ -814,32 +890,40 @@ async def _events_view() -> None:
         metas = store.event_metas(s)
     zone = tz()
     day = None
+    group = None
     for e in events:
         st, en = e.start.astimezone(zone), e.end.astimezone(zone)
-        if st.date() != day:
+        if st.date() != day:  # each day is one outlined list
             day = st.date()
-            ui.label(st.strftime("%A, %B %d")).classes("font-medium mt-3")
-        with ui.row().classes("items-center gap-3 pl-2"):
-            ui.label(f"{st:%H:%M}–{en:%H:%M}").classes("w-28 font-mono text-sm")
-            ui.label(e.title).classes("w-72 truncate")
+            ui.label(f"{st:%A, %B} {st.day}").classes("text-sm font-medium text-gray-600 mt-3")
+            group = ui.column().classes("events-day w-full gap-0")
+        with group, ui.row().classes("event-row w-full items-center gap-3 no-wrap"):
+            ui.label(fmt.span(st, en)).classes("w-36 shrink-0 font-mono text-sm text-gray-600")
+            ui.label(e.title).classes("grow truncate")
 
-            def save(ev_id=e.id, sw=None, num=None):
-                with db.session() as s:
-                    store.set_event_meta(s, ev_id, skippable=sw.value, skip_cost=float(num.value or 0))
-                ui.notify("Saved for this event.", type="positive")
-
-            sw = ui.switch("Skippable", value=e.skippable)
-            num = ui.number("Cost", value=e.skip_cost or 4, min=0, step=1).classes("w-24") \
-                .bind_visibility_from(sw, "value")
-            sw.on_value_change(lambda _, f=save, a=sw, b=num: f(sw=a, num=b))
-            num.on("blur", lambda _, f=save, a=sw, b=num: f(sw=a, num=b))
-            if e.id in metas:
-                def reset(ev_id=e.id):
+            # No fixed width: the title gives way instead, and the switch stays at the far right.
+            controls = ui.row().classes("shrink-0 items-center justify-end gap-2 no-wrap")
+            with controls:
+                def save(ev_id=e.id, sw=None, sel=None):
                     with db.session() as s:
-                        store.clear_event_meta(s, ev_id)
-                    events_view.refresh()
+                        store.set_event_meta(s, ev_id, skippable=sw.value, skip_for=int(sel.value or 2))
+                    ui.notify("Saved for this event.", type="positive")
 
-                ui.button("Use rule", on_click=reset).props("flat dense").tooltip("Forget settings for this event")
+                sw = ui.switch("Skippable", value=e.skippable).classes("order-last")  # always at the far right
+                sel = ui.select({k: v.removesuffix(" work") for k, v in SKIP_FOR_CHOICES.items()},
+                                label="Skip for", value=e.skip_for or 2).props("dense").classes("w-36 shrink-0").bind_visibility_from(sw, "value").mark(f"skip-for-{e.id}")
+                ui.icon("info_outline", size="18px", color="grey-6").classes("cursor-help") \
+                    .bind_visibility_from(sw, "value").tooltip(SKIP_FOR_HELP).mark(f"skip-info-{e.id}")
+                sw.on_value_change(lambda _, f=save, a=sw, b=sel: f(sw=a, sel=b))
+                sel.on_value_change(lambda _, f=save, a=sw, b=sel: f(sw=a, sel=b))
+                if e.id in metas:
+                    def reset(ev_id=e.id):
+                        with db.session() as s:
+                            store.clear_event_meta(s, ev_id)
+                        events_view.refresh()
+
+                    ui.button("Use rule", on_click=reset).props("flat dense no-wrap").classes("whitespace-nowrap") \
+                        .tooltip("Forget settings for this event")
 
 
 # ---- Preferences -----------------------------------------------------------------------
@@ -867,25 +951,27 @@ def account_view() -> None:
     body()
 
 
+def _section(title: str, marker: str, open_: bool = False):
+    return ui.expansion(title, value=open_).classes("w-full text-lg font-medium").mark(marker)
+
+
 def prefs_view() -> None:
-    ui.label("Your day").classes("text-lg font-medium")
-    form = PrefsForm()
+    with _section("Your Day", "prefs-day", open_=True), ui.column().classes("w-full text-base font-normal"):
+        form = PrefsForm()
 
-    def save() -> None:
-        if form.save():
-            ui.notify("Preferences saved. Re-plan to apply them.", type="positive")
+        def save() -> None:
+            if form.save():
+                ui.notify("Preferences saved. Re-plan to apply them.", type="positive")
 
-    ui.button("Save preferences", icon="save", on_click=save).mark("prefs-save")
-    ui.separator().classes("my-4")
-    ui.label("Google Calendar").classes("text-lg font-medium")
-    account_view()
-    ui.label("Calendars that block time").classes("font-medium mt-2")
-    calendar_picker()
-    ui.separator().classes("my-4")
-    ui.label("Natural Language Input").classes("text-lg font-medium")
-    ui.label("Optional: plan by chatting with Claude. Without an API key or Claude Desktop, Schedule Optimizer is "
-             "100% functional, offline too.").classes("text-sm text-gray-500")
-    nl_input_view()
+        ui.button("Save preferences", icon="save", on_click=save).mark("prefs-save")
+    with _section("Google Calendar", "prefs-google"), ui.column().classes("w-full text-base font-normal"):
+        account_view()
+        ui.label("Calendars That Block Time").classes("font-medium mt-2")
+        calendar_picker()
+    with _section("Natural Language Input", "prefs-nl"), ui.column().classes("w-full text-base font-normal"):
+        ui.label("Optional: plan by chatting with Claude. Without an API key or Claude Desktop, Schedule Optimizer "
+                 "is 100% functional, offline too.").classes("text-sm text-gray-500")
+        nl_input_view()
 
 
 def start_claude_chat() -> None:
@@ -943,7 +1029,7 @@ def nl_input_view() -> None:
         chat_view.refresh()
 
     # -- API key --
-    ui.label("Claude API key").classes("font-medium mt-2")
+    ui.label("Claude API Key").classes("font-medium mt-2")
     ui.label("Chat in the Claude tab, billed per use to your Claude Console account.").classes("text-sm text-gray-500")
     if claude_api.has_key():
         with ui.row().classes("items-center gap-3"):
@@ -1001,7 +1087,7 @@ def nl_input_view() -> None:
     with ui.row().classes("items-center gap-3"):
         if configured and seen:
             ui.icon("check_circle", color="positive")
-            ui.label(f"Connected (Claude Desktop last started it {seen.astimezone(zone):%a %H:%M}).") \
+            ui.label(f"Connected (Claude Desktop last started it {fmt.when(seen.astimezone(zone))}).") \
                 .classes("text-sm").mark("desktop-connected")
         elif configured:
             ui.icon("schedule", color="warning")
@@ -1034,7 +1120,7 @@ def nl_input_view() -> None:
             ui.button("Undo", icon="undo", on_click=undo).props("flat dense").mark("desktop-undo") \
                 .tooltip("Restore Claude Desktop's config file from the saved copy")
 
-    with ui.expansion("Set it up manually instead").classes("w-full text-sm").mark("desktop-manual"):
+    with ui.expansion("Set It Up Manually Instead").classes("w-full text-sm").mark("desktop-manual"):
         path = desktop_setup.config_path()
         ui.label("1. Open Claude Desktop's config file (or in Claude Desktop: Settings › Developer › Edit Config):") \
             .classes("text-sm")
@@ -1049,14 +1135,14 @@ def nl_input_view() -> None:
         ui.label(f"3. Save the file, then fully quit Claude Desktop ({_quit_hint()}) and reopen it.") \
             .classes("text-sm mt-2")
 
-    ui.label("2. Start a chat").classes("text-sm font-medium mt-4")
+    ui.label("2. Start a Chat").classes("text-sm font-medium mt-4")
     ui.label(f"Click below, then paste the copied message (“{store.ACTIVATION_PHRASE} (code …)”) as the first "
              "message of a new Claude Desktop chat. Only a chat with that code can use Schedule Optimizer, until "
              "you end it below.").classes("text-sm text-gray-500")
     ui.button("Start a Claude chat", icon="chat", on_click=start_claude_chat).mark("start-claude-chat")
 
     if codes:
-        ui.label("Active chats").classes("text-sm font-medium mt-4")
+        ui.label("Active Chats").classes("text-sm font-medium mt-4")
         ui.label("Each code works in any chat you pasted it into. End one to cut those chats off.") \
             .classes("text-sm text-gray-500")
 
@@ -1079,7 +1165,7 @@ def nl_input_view() -> None:
             started = c.created_at.astimezone(zone)
             with ui.row().classes("items-center gap-3 pl-2").mark(f"chat-{c.code}"):
                 ui.label(c.code).classes("font-mono text-sm w-20")
-                ui.label(f"started {started:%a %b} {started.day} {started:%H:%M}") \
+                ui.label(f"started {fmt.when(started)}") \
                     .classes("text-sm text-gray-600")
                 ui.button("End", on_click=lambda code=c.code: end_one(code)).props("flat dense") \
                     .mark(f"end-{c.code}")
@@ -1095,7 +1181,7 @@ def setup_view() -> None:
         ui.label("Welcome to Schedule Optimizer").classes("text-2xl font-medium")
         ui.label("Three quick steps. You can change everything later in Preferences.").classes("text-gray-500")
         with ui.stepper().props("vertical flat").classes("w-full") as stepper:
-            with ui.step("Your day"):
+            with ui.step("Your Day"):
                 form = PrefsForm(advanced=False)
                 with ui.stepper_navigation():
                     ui.button("Next", on_click=lambda: form.save() and stepper.next()).mark("setup-next-1")
@@ -1106,7 +1192,7 @@ def setup_view() -> None:
                 with ui.stepper_navigation():
                     ui.button("Next", on_click=stepper.next).mark("setup-next-2")
                     ui.button("Back", on_click=stepper.previous).props("flat")
-            with ui.step("Busy calendars"):
+            with ui.step("Busy Calendars"):
                 calendar_picker()
                 with ui.stepper_navigation():
                     def finish() -> None:
@@ -1147,8 +1233,11 @@ def root_view() -> None:
         with ui.tab_panel(tasks_tab):
             tasks_view()
         with ui.tab_panel(events_tab):
-            rules_view()
-            ui.button("Reload events", icon="refresh", on_click=events_view.refresh).props("flat").classes("mt-4")
+            with ui.expansion("Add Event Rules").classes("w-full text-base font-medium").mark("rules-section"):
+                rules_view()
+            with ui.row().classes("w-full items-center justify-between mt-2"):
+                ui.label("Upcoming Events").classes("text-lg font-medium")
+                ui.button("Reload", icon="refresh", on_click=events_view.refresh).props("flat dense")
             events_view()
         with ui.tab_panel(prefs_tab):
             prefs_view()
@@ -1157,11 +1246,15 @@ def root_view() -> None:
 def root() -> None:
     """Builds the page for each window (NiceGUI calls this per client)."""
     ui.page_title("Schedule Optimizer")
+    theme.apply()
     with ui.header().classes("items-center"):
-        ui.icon("event_available").classes("text-2xl")
+        ui.icon("event_available", color="primary").classes("text-2xl")
         ui.label("Schedule Optimizer").classes("text-lg font-medium")
-    with ui.column().classes("w-full max-w-5xl mx-auto p-4"):
+    with ui.column().classes("w-full max-w-3xl mx-auto p-4"):
         root_view()
+    client_id = ui.context.client.id
+    TOAST_AREAS[client_id] = ui.element("div")  # undo popups live here, outside the redraws
+    ui.context.client.on_disconnect(lambda: TOAST_AREAS.pop(client_id, None))
     watch_for_outside_changes()
 
 

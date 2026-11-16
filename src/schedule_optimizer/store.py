@@ -180,6 +180,32 @@ def purge_done_tasks(s: Session, now: datetime | None = None) -> int:
     return len(old)
 
 
+def delete_task_with_undo(s: Session, task_id: int) -> dict:
+    """Delete a task and return a snapshot that restore_task() can put back exactly
+    (same ids, its logged progress and its plan blocks)."""
+    task = s.get(Task, task_id)
+    if task is None:
+        raise KeyError(f"no task with id {task_id}")
+    snap = {
+        "task": task.model_dump(),
+        "logs": [r.model_dump() for r in s.exec(select(ProgressLog).where(ProgressLog.task_id == task_id))],
+        "blocks": [r.model_dump() for r in s.exec(select(PlanBlock).where(PlanBlock.task_id == task_id))],
+    }
+    s.delete(task)
+    s.commit()
+    return snap
+
+
+def restore_task(s: Session, snap: dict) -> Task:
+    task = Task(**snap["task"])
+    s.add(task)
+    s.flush()  # the task must exist before rows that point to it
+    s.add_all([ProgressLog(**r) for r in snap["logs"]] + [PlanBlock(**r) for r in snap["blocks"]])
+    s.commit()
+    s.refresh(task)
+    return task
+
+
 def list_tasks(s: Session, include_done: bool = False) -> list[Task]:
     q = select(Task).order_by(Task.id)
     if not include_done:
@@ -223,12 +249,17 @@ def remaining_minutes(s: Session, task: Task, now: datetime, tz: tzinfo) -> int:
 # ---- events ------------------------------------------------------------------------
 
 
-def add_title_rule(s: Session, pattern: str, skippable: bool = True, skip_cost: float = 4.0) -> TitleRule:
+def _check_skip_for(skip_for: int) -> int:
+    skip_for = int(skip_for)
+    if not 1 <= skip_for <= 5:
+        raise ValueError("skip_for must be 1–5 (5 = any work)")
+    return skip_for
+
+
+def add_title_rule(s: Session, pattern: str, skippable: bool = True, skip_for: int = 2) -> TitleRule:
     if not pattern.strip():
         raise ValueError("pattern is required")
-    if skip_cost < 0:
-        raise ValueError("skip_cost can't be negative")
-    rule = TitleRule(pattern=pattern.strip(), skippable=skippable, skip_cost=skip_cost)
+    rule = TitleRule(pattern=pattern.strip(), skippable=skippable, skip_for=_check_skip_for(skip_for))
     s.add(rule)
     s.commit()
     s.refresh(rule)
@@ -247,9 +278,9 @@ def delete_title_rule(s: Session, rule_id: int) -> None:
     s.commit()
 
 
-def set_event_meta(s: Session, google_event_id: str, skippable: bool, skip_cost: float = 4.0) -> EventMeta:
+def set_event_meta(s: Session, google_event_id: str, skippable: bool, skip_for: int = 2) -> EventMeta:
     meta = s.get(EventMeta, google_event_id) or EventMeta(google_event_id=google_event_id)
-    meta.skippable, meta.skip_cost = skippable, skip_cost
+    meta.skippable, meta.skip_for = skippable, _check_skip_for(skip_for)
     s.add(meta)
     s.commit()
     s.refresh(meta)
@@ -275,13 +306,15 @@ def apply_event_settings(s: Session, events: list[EventInput]) -> list[EventInpu
     metas = {m.google_event_id: m for m in s.exec(select(EventMeta).where(col(EventMeta.google_event_id).in_(ids)))}
     out = []
     for e in events:
-        skippable, cost = False, 0.0
+        skippable, skip_for = False, None
         if (m := metas.get(e.id)) is not None:
-            skippable, cost = m.skippable, m.skip_cost
+            skippable, skip_for = m.skippable, m.skip_for
         elif rule := next((r for r in rules if r.pattern.lower() in e.title.lower()), None):
-            skippable, cost = rule.skippable, rule.skip_cost
+            skippable, skip_for = rule.skippable, rule.skip_for
+        minutes = (e.end - e.start).total_seconds() / 60
         out.append(EventInput(e.id, e.title, e.start, e.end, skippable=skippable,
-                              skip_cost=cost if skippable else 0.0))
+                              skip_cost=domain.skip_cost_for(skip_for, minutes) if skippable else 0.0,
+                              skip_for=skip_for if skippable else None))
     return out
 
 
@@ -356,7 +389,7 @@ def plan_now(
 
 def _event_dict(e: EventInput, attend: bool) -> dict:
     return {"id": e.id, "title": e.title, "start": e.start.isoformat(), "end": e.end.isoformat(),
-            "skippable": e.skippable, "skip_cost": e.skip_cost, "attend": attend}
+            "skippable": e.skippable, "skip_cost": e.skip_cost, "skip_for": e.skip_for, "attend": attend}
 
 
 def save_last_solve(s: Session, plan: Plan, events: list[EventInput], conflicts: list, source: str,
@@ -388,7 +421,7 @@ def solve_events(row: LastSolve | None) -> list[EventInput]:
     out = []
     for e in (row.events if row else []):
         out.append(EventInput(e["id"], e["title"], datetime.fromisoformat(e["start"]),
-                              datetime.fromisoformat(e["end"]), e["skippable"], e["skip_cost"]))
+                              datetime.fromisoformat(e["end"]), e["skippable"], e["skip_cost"], e.get("skip_for")))
     return out
 
 

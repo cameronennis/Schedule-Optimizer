@@ -30,11 +30,11 @@ Without an API key or Claude Desktop, the app is 100% functional, offline too. C
 ## Command line
 
 ```bash
-uv run schedule-optimizer task add "Chem midterm" --hours 8 --due "2026-11-19 09:00" --priority 5
+uv run schedule-optimizer task add "Chem midterm" --hours 8 --due "2026-11-19 09:00" --priority 1
 uv run schedule-optimizer task add "Reading" --weekly-hours 3 --when evening
 uv run schedule-optimizer task list
 uv run schedule-optimizer log 1 45            # 45 minutes on task 1, ending now
-uv run schedule-optimizer rule add Lecture --cost 4
+uv run schedule-optimizer rule add Lecture --skip-for 2   # skippable only for priority 1–2 work
 uv run schedule-optimizer events              # upcoming events and how they're treated
 uv run schedule-optimizer plan                # solve against your calendar (or --offline)
 uv run schedule-optimizer approve             # also writes blocks to your "Optimizer" calendar

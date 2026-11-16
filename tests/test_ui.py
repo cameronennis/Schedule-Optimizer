@@ -61,13 +61,13 @@ async def test_add_task_in_window_and_see_it_in_the_plan(app_db):
         user.find(marker="task-hours").clear().type("2")
         user.find(marker="task-save").click()
         await user.should_see("Write lab report")
-        await user.should_see("2 h 00 min left of 2 h 00 min")
+        await user.should_see("2 h 00 min left")
 
         user.find(marker="replan").click()
-        await user.should_see("Proposed plan", retries=100)  # solving runs in a worker thread
+        await user.should_see("Proposed Plan", retries=100)  # solving runs in a worker thread
         await user.should_see(marker="approve")
         user.find(marker="approve").click()
-        await user.should_see("Approved plan")
+        await user.should_see("Approved Plan")
     with db.session() as s:
         [t] = store.list_tasks(s)
         assert t.total_minutes == 120
@@ -91,9 +91,9 @@ async def test_task_with_deadline_date_only(app_db):
         await user.open("/")
         user.find(marker="add-task").click()
         user.find(marker="task-title").type("Essay")
-        user.find(marker="task-deadline-date").type("2030-01-15")
+        user.find(marker="task-deadline-date").type("01-15-2030")
         user.find(marker="task-save").click()
-        await user.should_see("due Wed Jan 16 00:00")
+        await user.should_see("Due 01-15-2030, end of day")
 
 
 async def test_log_progress_and_mark_done(app_db):
@@ -105,21 +105,49 @@ async def test_log_progress_and_mark_done(app_db):
         user.find(marker="log").click()
         user.find(marker="log-minutes").clear().type("45")
         user.find(marker="log-save").click()
-        await user.should_see("1 h 15 min left of 2 h 00 min")
+        await user.should_see("1 h 15 min left")
         user.find(marker=f"done-{t.id}").click()
-        await user.should_see("No tasks yet")
+        await user.should_see("No tasks yet", retries=50)  # after the 0.4 s done animation
 
 
-async def test_delete_asks_first(app_db):
+async def test_delete_can_be_undone(app_db):
     finish_setup()
     with db.session() as s:
         t = store.add_task(s, title="Old task", total_minutes=60)
+        store.log_progress(s, t.id, 15, datetime.now(store.local_tz(store.get_prefs(s))))
     async with user_simulation(root=ui_app.root) as user:
         await user.open("/")
         user.find(marker=f"delete-{t.id}").click()
-        await user.should_see("Delete “Old task” and its logged progress?")
-        user.find(marker="confirm-delete").click()
+        await user.should_see("Deleted “Old task”", retries=50)  # the popup, after the card folds away
         await user.should_see("No tasks yet")
+        user.find(marker="undo-action").click()
+        await user.should_see("Old task")
+        await user.should_not_see(marker="undo-toast")
+    with db.session() as s:
+        [back] = store.list_tasks(s)
+        assert back.id == t.id and store.logged_minutes(s, t.id) == 15  # same task, progress kept
+
+
+async def test_mark_done_flashes_then_completes_with_undo(app_db):
+    finish_setup()
+    with db.session() as s:
+        t = store.add_task(s, title="Finish me", total_minutes=60)
+    async with user_simulation(root=ui_app.root) as user:
+        await user.open("/")
+        [card] = user.find(marker=f"task-{t.id}").elements
+        user.find(marker=f"done-{t.id}").click()
+        await asyncio.sleep(0.05)  # the click handler runs as a background task
+        assert "done-flash" in card.classes  # glowing, and not done yet
+        with db.session() as s:
+            assert store.list_tasks(s) != []
+        await asyncio.sleep(ui_app.DONE_FLASH_SECONDS + ui_app.COLLAPSE_SECONDS + 0.2)
+        await user.should_see("Marked “Finish me” done")
+        await user.should_see("No tasks yet")
+        user.find(marker="undo-action").click()
+        await user.should_see("Finish me")
+    with db.session() as s:
+        [back] = store.list_tasks(s)
+        assert back.status.value == "active" and back.completed_at is None
 
 
 async def test_title_rules_can_be_added_and_removed(app_db):
@@ -127,13 +155,15 @@ async def test_title_rules_can_be_added_and_removed(app_db):
     async with user_simulation(root=ui_app.root) as user:
         await user.open("/")
         user.find(marker="rule-pattern").type("Lecture")
-        user.find(marker="rule-cost").clear().type("6")
+        [skip_for] = user.find(marker="rule-skip-for").elements
+        skip_for.set_value(1)
         user.find(marker="rule-add").click()
-        await user.should_see("skippable, cost 6 points")
+        await user.should_see("skippable for priority 1")
         with db.session() as s:
             [r] = store.list_title_rules(s)
+            assert r.skip_for == 1
         user.find(marker=f"rule-delete-{r.id}").click()
-        await user.should_not_see("skippable, cost 6 points")
+        await user.should_not_see("skippable for priority 1")
 
 
 async def test_preferences_tab_rejects_bad_times(app_db):
@@ -175,7 +205,7 @@ async def test_proposal_can_be_applied_from_the_now_tab(app_db):
     now = local_now()
     with db.session() as s:
         t = store.add_task(s, title="Essay", total_minutes=60)
-        row = changes.propose(s, [{"op": "update_task", "task_id": t.id, "priority": 5}],
+        row = changes.propose(s, [{"op": "update_task", "task_id": t.id, "priority": 1}],
                               "Make the essay top priority", [], now)
     async with user_simulation(root=ui_app.root) as user:
         await user.open("/")
@@ -183,7 +213,7 @@ async def test_proposal_can_be_applied_from_the_now_tab(app_db):
         user.find(marker=f"apply-{row.id}").click()
         await user.should_see("Applied", retries=100)
     with db.session() as s:
-        assert store.list_tasks(s)[0].priority == 5
+        assert store.list_tasks(s)[0].priority == 1
         assert changes.pending(s) == []
 
 
@@ -325,3 +355,18 @@ async def test_end_one_claude_chat_keeps_the_others(app_db):
         await user.should_see(marker=f"chat-{b.code}")
     with db.session() as s:
         assert [c.code for c in store.active_chat_codes(s)] == [b.code]
+
+
+
+async def test_paused_task_can_still_be_marked_done(app_db):
+    finish_setup()
+    with db.session() as s:
+        t = store.add_task(s, title="Paused essay", total_minutes=60)
+        store.update_task(s, t.id, status="paused")
+    async with user_simulation(root=ui_app.root) as user:
+        await user.open("/")
+        await user.should_see(marker=f"done-{t.id}")
+        user.find(marker=f"done-{t.id}").click()
+        await user.should_see("Marked “Paused essay” done", retries=100)
+    with db.session() as s:
+        assert store.list_tasks(s) == []

@@ -43,7 +43,7 @@ def test_conflict_names_the_deadline_and_the_event_in_the_way():
     [c] = diagnose(plan, tasks, [seminar], prefs, NOW)
     assert c.kind == "rules" and c.unmet_minutes == plan.unmet_minutes["t"] > 0
     assert [(r.kind, r.event_ids) for r in c.rules] == [("deadline", []), ("event", ["sem"])]
-    assert c.rules[1].label == "“Seminar” Wed Nov 18 09:00–11:00"
+    assert c.rules[1].label == "“Seminar” Wed, Nov 18, 9:00–11:00 AM"
 
 
 def test_deadline_alone_when_nothing_else_would_help():
@@ -54,8 +54,8 @@ def test_deadline_alone_when_nothing_else_would_help():
 
 
 def test_conflict_from_other_tasks_is_competition():
-    tasks = [TaskInput("a", "Top", remaining_minutes=120, priority=5, deadline=at(18, 12)),
-             TaskInput("b", "Low", remaining_minutes=120, priority=1, deadline=at(18, 12))]
+    tasks = [TaskInput("a", "Top", remaining_minutes=120, priority=1, deadline=at(18, 12)),
+             TaskInput("b", "Low", remaining_minutes=120, priority=5, deadline=at(18, 12))]
     prefs = Preferences()
     plan = solve(tasks, [], prefs, NOW)
     assert "b" in plan.unmet_minutes
@@ -132,8 +132,8 @@ def test_dismiss(s):
 
 def test_tools_read_plan_and_explain_a_block(s):
     lecture = EventInput("lec", "Lecture", at(18, 9), at(18, 10))
-    store.set_event_meta(s, "lec", skippable=True, skip_cost=0.5)
-    store.add_task(s, title="Midterm", total_minutes=240, priority=5, deadline=at(18, 12, 30))
+    store.set_event_meta(s, "lec", skippable=True, skip_for=5)  # any work may take its place
+    store.add_task(s, title="Midterm", total_minutes=240, priority=1, deadline=at(18, 12, 30))
     store.plan_now(s, [lecture], NOW)
     plan = claude_tools.run_tool(s, "get_plan", {}, CTX)
     assert plan["plan_state"].startswith("proposed")
@@ -154,7 +154,7 @@ def test_propose_then_apply_through_tools(s):
                                                      "start": "2026-11-18T08:00", "end": "2026-11-18T08:30"}]}, CTX)
     assert prop["after"]["blocks"][0]["start"] >= "2026-11-18T08:35"
     res = claude_tools.run_tool(s, "apply_changes", {"proposal_id": prop["proposal_id"]}, CTX)
-    assert res["applied"] == ["Hold “Walk” Wed 08:00–08:30"]
+    assert res["applied"] == ["Hold “Walk” Wed, Nov 18, 8:00–8:30 AM"]
 
 
 # ---- MCP helper over stdio ---------------------------------------------------------------------------
@@ -438,3 +438,67 @@ def test_old_code_refuses_newer_data(tmp_path):
     con.close()
     with pytest.raises(db.NewerDataError, match="newer version"):
         db.make_engine(path)
+
+
+
+# ---- AM/PM and MM-DD-YYYY ---------------------------------------------------------------
+
+from schedule_optimizer import fmt  # noqa: E402
+
+
+def test_times_and_dates_read_the_american_way():
+    from datetime import time
+
+    assert fmt.clock(time(0, 5)) == "12:05 AM" and fmt.clock(time(12, 0)) == "12:00 PM"
+    assert fmt.clock(time(21, 30)) == "9:30 PM"
+    assert fmt.span(at(18, 9), at(18, 10, 30)) == "9:00–10:30 AM"
+    assert fmt.span(at(18, 11, 30), at(18, 13, 20)) == "11:30 AM–1:20 PM"
+    assert fmt.date_text(at(18, 9)) == "11-18-2026" and fmt.day(at(18, 9)) == "Wed, Nov 18"
+    assert fmt.deadline(at(19, 0)) == "11-18-2026, end of day"
+    assert fmt.deadline(at(19, 9)) == "11-19-2026 9:00 AM"
+    for text in ("9:30 PM", "9:30pm", "9:30 p.m.", "21:30"):
+        assert fmt.parse_clock(text) == time(21, 30)
+    assert fmt.parse_clock("12 am") == time(0, 0) and fmt.parse_clock("12pm") == time(12, 0)
+    assert fmt.parse_date("11-19-2026") == fmt.parse_date("11/19/2026") == fmt.parse_date("2026-11-19")
+    with pytest.raises(ValueError):
+        fmt.parse_clock("13:00 PM")
+    assert fmt.time_options()[:2] == ["12:00 AM", "12:15 AM"] and len(fmt.time_options()) == 96
+
+
+
+# ---- skip-for thresholds ----------------------------------------------------------------
+
+def test_skip_threshold_lets_only_allowed_priorities_take_the_time():
+    """A lecture skippable for priority 1–2 work is skipped for priority 2 work, never for priority 3."""
+    from schedule_optimizer.domain import skip_cost_for
+
+    def plan_with(priority):
+        lec = EventInput("lec", "Lecture", at(18, 9), at(18, 10), skippable=True,
+                         skip_cost=skip_cost_for(2, 60), skip_for=2)
+        tasks = [TaskInput("t", "Paper", remaining_minutes=180, priority=priority, deadline=at(18, 11))]
+        return solve(tasks, [lec], Preferences(), NOW)
+
+    assert [e.attend for e in plan_with(2).events] == [False]  # skipped for priority 2
+    assert [e.attend for e in plan_with(3).events] == [True]  # kept for priority 3
+    assert skip_cost_for(5, 60) < 2 < skip_cost_for(4, 60) < 4  # "any work" costs less than priority 5 earns
+
+
+def test_old_skip_costs_are_cleared_on_upgrade(tmp_path):
+    import sqlite3
+
+    path = tmp_path / "schedule.db"
+    eng = db.make_engine(path)
+    with Session(eng) as s:
+        store.add_title_rule(s, "Lecture", skip_for=2)
+        store.set_event_meta(s, "e1", skippable=True)
+        store.set_event_meta(s, "e2", skippable=False)
+    eng.dispose()
+    con = sqlite3.connect(path)
+    con.execute("PRAGMA user_version = 8")  # a file from before thresholds
+    con.commit()
+    con.close()
+    eng = db.make_engine(path)
+    with Session(eng) as s:
+        assert store.list_title_rules(s) == []  # old point costs aren't converted
+        assert set(store.event_metas(s)) == {"e2"}  # fixed settings stay
+    eng.dispose()

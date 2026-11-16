@@ -27,10 +27,36 @@ TIME_OF_DAY_WINDOWS: dict[TimeOfDay, tuple[time, time]] = {
 
 
 def priority_to_points_per_hour(priority: int) -> int:
-    """Priority 1–5 → 2–10 points per hour."""
+    """Priority 1 (top) … 5 (low) → 10 … 2 points per hour."""
     if not 1 <= priority <= 5:
         raise ValueError(f"priority must be 1–5, got {priority}")
-    return 2 * priority
+    return 2 * (6 - priority)
+
+
+# Skippable events say which work may take their place: priorities 1 through `skip_for`
+# (5 = any work). The planner works in points, so a threshold becomes a cost per hour
+# halfway between the lowest allowed priority's value and the next one down. Work at an
+# allowed priority earns more than the cost; work below it earns less, so it never wins.
+SKIP_FOR_CHOICES = {  # shown under the label "Skip for"
+    1: "Priority 1 work only",
+    2: "Priority 1–2 work",
+    3: "Priority 1–3 work",
+    4: "Priority 1–4 work",
+    5: "Any work",
+}
+
+
+def skip_for_short(skip_for: int) -> str:
+    """priority 1, priority 1–2, …, any priority."""
+    return "any priority" if skip_for >= 5 else ("priority 1" if skip_for == 1 else f"priority 1–{skip_for}")
+
+
+def skip_cost_for(skip_for: int, minutes: float) -> float:
+    """Points lost by skipping an event of `minutes` that may make way for priorities 1..skip_for."""
+    if not 1 <= skip_for <= 5:
+        raise ValueError(f"skip_for must be 1–5, got {skip_for}")
+    per_hour = 2 * (6 - skip_for) - 1  # 9, 7, 5, 3, 1: between 10/8, 8/6, 6/4, 4/2, 2/0
+    return per_hour * minutes / 60
 
 
 @dataclass
@@ -77,7 +103,8 @@ class EventInput:
     start: datetime
     end: datetime
     skippable: bool = False
-    skip_cost: float = 0.0  # points; only used if skippable
+    skip_cost: float = 0.0  # points; only used if skippable (from skip_for, see skip_cost_for)
+    skip_for: int | None = None  # priorities 1..skip_for may take its place (5 = any)
 
 
 @dataclass
@@ -118,6 +145,7 @@ class EventDecision:
     end: datetime
     attend: bool
     skip_cost: float
+    skip_for: int | None = None
 
 
 @dataclass

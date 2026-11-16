@@ -79,6 +79,41 @@ body {{ background: var(--canvas); color: var(--ink); -webkit-font-smoothing: an
   .task-actions {{ margin-left: -8px; }}
 }}
 
+/* Now tab actions: equal-width buttons, centered, in one row; two rows of two when the panel
+   is too narrow for one (a container query, so it follows the panel, not the window). */
+.now-actions-box {{ container-type: inline-size; width: 100%; }}
+.now-actions {{ display: grid; grid-template-columns: repeat(var(--n, 4), minmax(0, 1fr)); gap: 10px; }}
+@container (max-width: 620px) {{ .now-actions {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }} }}
+@container (max-width: 300px) {{ .now-actions {{ grid-template-columns: 1fr; }} }}
+.now-actions > * {{ width: 100%; min-width: 0; }}
+.now-actions > .q-btn-group > .q-btn:first-child {{ flex: 1 1 auto; }}
+.now-actions .q-btn:not(.q-btn-dropdown__arrow-container) {{ padding-left: 12px; padding-right: 12px; }}
+
+/* Claude chat: an outlined, rounded thread; Claude's messages on soft gray, yours in the accent
+   color; no speech-bubble tails. Quasar paints a bubble with currentColor, so color sets the fill. */
+.chat-thread {{ border: 1px solid var(--line); border-radius: 12px; padding: 14px; gap: 10px; min-height: 120px; }}
+.chat-empty {{ margin: auto 0; text-align: center; padding: 24px 12px; }}
+.chat-thread .q-message {{ max-width: 85%; }}
+.chat-thread .q-message-sent {{ align-self: flex-end; }}
+.chat-thread .q-message-received {{ align-self: flex-start; }}
+.q-message-text {{ border-radius: 14px; padding: 8px 12px; min-height: 0; }}
+.q-message-text:last-child:before {{ display: none; }}
+.q-message-text--received {{ color: #F1F1EF; border-bottom-left-radius: 4px; }}
+.q-message-text-content--received {{ color: var(--ink); }}
+.q-message-text--sent {{ color: {ACCENT}; border-bottom-right-radius: 4px; }}
+.q-message-text-content--sent {{ color: #FFFFFF; }}
+.q-message-text-content p {{ margin: 0; }}
+.q-message-text-content p + p, .q-message-text-content ul, .q-message-text-content ol {{ margin-top: .5em; }}
+.chat-tool {{ color: var(--muted); font-size: 12px; padding-left: 4px; }}
+/* The message box: a full rounded outline (not just an underline), with the send button inside. */
+.chat-box .q-field__control {{ border-radius: 12px; background: var(--surface); }}
+.chat-box .q-field__control:before {{ border-color: var(--line); }}
+/* The send button stays inside the outline: 30px in the 40px bottom row, so 5px clear on each side,
+   and it sits on the last line as the box grows. */
+.chat-box .q-field__append {{ align-self: flex-end; height: 40px; padding-left: 8px; }}
+.chat-send {{ background: {ACCENT}; color: #FFFFFF; width: 30px; height: 30px; min-width: 30px; min-height: 30px; }}
+.chat-send .q-icon {{ font-size: 18px; }}
+
 /* Undo popup at the bottom center, like Google Calendar's "Event deleted · Undo". */
 .undo-toast {{ position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%); z-index: 6000;
               background: #2B2B2D; color: #FFFFFF; border-radius: 8px; padding: 6px 8px 6px 16px;
@@ -88,6 +123,9 @@ body {{ background: var(--canvas); color: var(--ink); -webkit-font-smoothing: an
 
 /* Buttons and tabs: sentence case, no raised shadow. */
 .q-btn, .q-tab__label {{ text-transform: none; letter-spacing: 0; font-weight: 500; }}
+/* A button's icon and label always stay on one line. */
+.q-btn {{ white-space: nowrap; }}
+.q-btn__content {{ flex-wrap: nowrap; }}
 .q-btn--standard {{ box-shadow: none; }}
 .q-btn--rectangle {{ border-radius: 8px; }}
 /* Split buttons (Re-plan ▾): the group wraps both halves. Give it the same corners and no

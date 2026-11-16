@@ -90,7 +90,8 @@ class EventMeta(SQLModel, table=True):
 
     google_event_id: str = Field(primary_key=True)
     skippable: bool = False
-    skip_cost: float = 4.0  # points; only used if skippable
+    skip_cost: float = 4.0  # unused since schema v9 (costs come from skip_for)
+    skip_for: int = Field(default=2, ge=1, le=5)  # priorities 1..skip_for may take its place (5 = any)
     updated_at: datetime = _dt(default_factory=utcnow)
 
 
@@ -103,7 +104,8 @@ class TitleRule(SQLModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
     pattern: str
     skippable: bool = True
-    skip_cost: float = 4.0
+    skip_cost: float = 4.0  # unused since schema v9
+    skip_for: int = Field(default=2, ge=1, le=5)
     created_at: datetime = _dt(default_factory=utcnow)
 
 

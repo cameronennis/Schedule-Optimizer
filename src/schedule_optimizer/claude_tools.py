@@ -15,23 +15,27 @@ from datetime import datetime
 
 from sqlmodel import Session
 
-from . import changes, store
+from . import changes, fmt, store
 from .calendar_sync import busy_events_if_connected
+from .domain import priority_to_points_per_hour, skip_for_short
 from .tables import EffortMode, PlanBlock, Task
 
 
 INSTRUCTIONS = """\
 Schedule Optimizer plans the user's tasks around their Google Calendar with a solver.
-You never place blocks yourself: you change the solver's inputs (tasks, event skip
-costs, preferences, holds such as breaks), the user approves, and it re-plans.
+You never place blocks yourself: you change the solver's inputs (tasks, which events
+may be skipped, preferences, holds such as breaks), the user approves, and it re-plans.
 
 - Start with get_plan (and get_tasks) to see the current state. get_plan's "now" is
   the current local date and time.
 - To change anything, call propose_changes. It previews the result without changing
   anything.
-- All weights are points per hour: priority p is worth 2p points per hour of work;
-  an event's skip cost is the points lost by skipping it (cost 4 ≈ 24 min of
-  top-priority work).
+- Priority 1 is the top priority and 5 the lowest (worth 10 down to 2 points per hour).
+- Calendar events are fixed unless made skippable. A skippable event has skip_for:
+  the planner may skip it only when that's the only way to fit work of priority 1
+  through skip_for (5 = any work). Pick skip_for from what the user says; if it's
+  unclear, ask in plain words first, for example: "Should I only skip lectures for
+  your most important work, or for anything up to priority 3?"
 - When work doesn't fit, get_plan lists the conflicting rules. Propose relaxing one
   of them, and say what it costs.
 - When the user is tired or stressed, consider a break (add_hold) and lighter
@@ -123,7 +127,7 @@ def get_plan(s: Session, args: dict, ctx: Ctx) -> dict:
         "blocks": [{"block_id": b.id, "task_id": b.task_id, "task": titles.get(b.task_id, "?"),
                     "start": fmt_local(b.start, tz), "end": fmt_local(b.end, tz),
                     "minutes": int((b.end - b.start).total_seconds() // 60)} for b in blocks],
-        "preferences": {"awake": f"{prefs.awake_start:%H:%M}–{prefs.awake_end:%H:%M}",
+        "preferences": {"awake": fmt.span(prefs.awake_start, prefs.awake_end),
                         "max_focus_hours_per_day": prefs.max_focus_minutes_per_day / 60,
                         "buffer_minutes": prefs.buffer_minutes, "horizon_days": prefs.horizon_days},
         "holds": [{"hold_id": h.id, "title": h.title, "start": fmt_local(h.start, tz), "end": fmt_local(h.end, tz)}
@@ -140,7 +144,7 @@ def get_plan(s: Session, args: dict, ctx: Ctx) -> dict:
             {"event_id": e["id"], "title": e["title"],
              "start": fmt_local(datetime.fromisoformat(e["start"]), tz),
              "end": fmt_local(datetime.fromisoformat(e["end"]), tz),
-             **({"skippable": True, "skip_cost": e["skip_cost"], "attend": e["attend"]} if e["skippable"] else {})}
+             **({"skippable": True, "skip_for": e.get("skip_for"), "attend": e["attend"]} if e["skippable"] else {})}
             for e in row.events if datetime.fromisoformat(e["end"]) > now
         ]
     return out
@@ -154,7 +158,8 @@ def explain_block(s: Session, args: dict, ctx: Ctx) -> dict:
     task = s.get(Task, block.task_id)
     minutes = int((block.end - block.start).total_seconds() // 60)
     names = {
-        "value": f"value: {minutes / 60:g} h × {2 * task.priority} points/hour (priority {task.priority})",
+        "value": f"value: {minutes / 60:g} h × {priority_to_points_per_hour(task.priority)} points/hour "
+                 f"(priority {task.priority})",
         "block_cost": "fixed cost per block (prefers fewer, longer blocks)",
         "ideal_deviation": f"differs from the ideal block length ({task.ideal_block} min)",
         "time_of_day_bonus": f"inside the preferred time of day ({task.time_of_day.value})",
@@ -174,7 +179,8 @@ def explain_block(s: Session, args: dict, ctx: Ctx) -> dict:
         skipped = [e for e in row.events if e["skippable"] and not e["attend"]
                    and datetime.fromisoformat(e["start"]) < block.end and datetime.fromisoformat(e["end"]) > block.start]
         if skipped:
-            out["uses_time_from_skipped_events"] = [f"{e['title']} (skip cost {e['skip_cost']:g})" for e in skipped]
+            out["uses_time_from_skipped_events"] = [
+                f"{e['title']} (skippable for {skip_for_short(e.get('skip_for') or 5)} work)" for e in skipped]
         mine = [conflict_text(c) for c in row.conflicts if c["task_id"].split("@")[0] == str(task.id)]
         if mine:
             out["conflicts"] = mine
@@ -268,9 +274,10 @@ TOOLS: dict[str, dict] = {
     },
     "propose_changes": {
         "description": "Propose changes to the planner's inputs (never to blocks directly) and preview the "
-                       "re-planned result on a scratch copy. Nothing real changes. Weights are points per hour: "
-                       "priority p is worth 2p points per hour of work, and an event's skip cost is points lost "
-                       "by skipping it. For 'I'm tired', a break is an add_hold.",
+                       "re-planned result on a scratch copy. Nothing real changes. Priority 1 is top and 5 "
+                       "lowest; a skippable event's skip_for (1–5) says which priorities may take its time "
+                       "(5 = any). If the user's wishes are unclear, ask before proposing. For 'I'm tired', "
+                       "a break is an add_hold.",
         "input_schema": {"type": "object", "properties": {
             "summary": {"type": "string", "description": "One sentence the user will see."},
             "changes": {"type": "array", "items": changes.CHANGE_SCHEMA}}, "required": ["summary", "changes"]},

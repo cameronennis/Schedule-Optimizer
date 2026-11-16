@@ -20,6 +20,7 @@ from datetime import datetime, time
 
 from ortools.sat.python import cp_model
 
+from . import fmt
 from .domain import (
     TIME_OF_DAY_WINDOWS,
     EventDecision,
@@ -62,6 +63,7 @@ class _Chunk:
     deviation: cp_model.IntVar
     tod_len: cp_model.IntVar | None = None
     over: cp_model.IntVar | None = None  # slots beyond the soft max_block
+    interval: cp_model.IntervalVar | None = None  # padded by the buffer, like the global NoOverlap
     stay: list = field(default_factory=list)  # overlap with previously approved blocks
     overlaps: list = field(default_factory=list)  # one flag per previous span: overlaps it at all
 
@@ -88,7 +90,7 @@ def _merge(spans: list[tuple[int, int, EventInput]]) -> list[tuple[int, int, lis
 
 
 def _when(dt: datetime) -> str:
-    return f"{dt:%a %b} {dt.day} {dt:%H:%M}"  # no %-d: it isn't portable to Windows
+    return fmt.when(dt)
 
 
 @dataclass
@@ -136,8 +138,8 @@ def build_model(
     full_days = {d: w for d in dates if (w := grid.local_window(d, time(0), time(0)))}
     windows = full_days if diag else awake
     awake_lit = {
-        d: diag.lit(m, f"awake:{d}", Rule("awake", f"Awake hours {prefs.awake_start:%H:%M}–"
-                                                  f"{prefs.awake_end:%H:%M} on {d:%a %b} {d.day}", day=d.isoformat()))
+        d: diag.lit(m, f"awake:{d}", Rule("awake", f"Awake hours {fmt.span(prefs.awake_start, prefs.awake_end)} "
+                                                  f"on {fmt.day(d)}", day=d.isoformat()))
         for d in windows
     } if diag else {}
 
@@ -151,6 +153,10 @@ def build_model(
         return (lo, hi) if lo < hi else None
 
     fixed = [(*s, e) for e in events if not e.skippable and (s := span(e))]
+    # Skippable events with a threshold: work below it (a higher priority number) may never
+    # use their time, whether or not the event is skipped. The skip cost keeps allowed
+    # work from taking the time unless it can't fit anywhere else.
+    protected: list[tuple[int, int, int]] = []
     # Events short enough to sit inside a same-task break; an event between two blocks
     # is itself the break, so those blocks may be closer than SAME_TASK_BREAK_MINUTES.
     break_slots = max(buf, minutes_to_slots(SAME_TASK_BREAK_MINUTES))
@@ -159,7 +165,8 @@ def build_model(
         present = None
         if diag:
             names = " + ".join(f"“{e.title}”" for e in members)
-            rule = Rule("event", f"{names} {_when(grid.to_datetime(lo))}–{grid.to_datetime(hi):%H:%M}",
+            rule = Rule("event", f"{names} {fmt.day(grid.to_datetime(lo))}, "
+                                 f"{fmt.span(grid.to_datetime(lo), grid.to_datetime(hi))}",
                         event_ids=[e.id for e in members])
             present = diag.lit(m, f"event:{lo}:{hi}", rule)
             intervals.append(m.new_optional_fixed_size_interval_var(lo, hi - lo + buf, present, "fixed"))
@@ -174,6 +181,8 @@ def build_model(
         lo, hi = s
         attend = m.new_bool_var(f"attend[{e.id}]")
         out.attend[e.id] = attend
+        if e.skip_for is not None:
+            protected.append((lo, hi, e.skip_for))
         if diag and e.id in diag.attended:
             rule = Rule("attend", f"Attending “{e.title}” {_when(e.start.astimezone(grid.tz))} "
                                   f"(skip cost {e.skip_cost:g})", event_ids=[e.id])
@@ -259,7 +268,8 @@ def build_model(
             m.add(length == min_len).only_enforce_if(~p)
             # The interval links start + size == end when present; end must be its own var.
             padded_end = m.new_int_var(lo_b, hi_b + buf, f"e[{name}]")
-            intervals.append(m.new_optional_interval_var(s, length + buf, padded_end, p, f"iv[{name}]"))
+            iv = m.new_optional_interval_var(s, length + buf, padded_end, p, f"iv[{name}]")
+            intervals.append(iv)
 
             # Pick exactly one day (if present) and stay inside its awake window.
             on_day = {}
@@ -294,7 +304,7 @@ def build_model(
                 m.add(over == 0).only_enforce_if(~p)
                 objective.append(-over_units * over)
 
-            chunk = _Chunk(task, p, s, length, placed, dev, over=over)
+            chunk = _Chunk(task, p, s, length, placed, dev, over=over, interval=iv)
             if tod_windows:
                 t = m.new_bool_var(f"tod[{name}]")
                 m.add_implication(t, p)
@@ -369,6 +379,11 @@ def build_model(
             # Exactly one reason per gap (not "at least one"), so one plan has one encoding.
             m.add(sum(options) == 1).only_enforce_if(b.present)
             m.add(sum(options) == 0).only_enforce_if(~b.present)
+        # This task's work can't take time from events it isn't allowed to skip.
+        off_limits = [(lo, hi) for lo, hi, skip_for in protected if task.priority > skip_for]
+        if off_limits and task_chunks:
+            walls = [m.new_fixed_size_interval_var(lo, hi - lo + buf, f"wall[{task.id}]") for lo, hi in off_limits]
+            m.add_no_overlap([c.interval for c in task_chunks] + walls)
         if task_chunks and not prev_spans and diag is None:
             sig = (rem, task.priority, task.deadline, task.earliest_start, task.min_block,
                    task.ideal_block, task.max_block, task.time_of_day)
@@ -399,7 +414,7 @@ def build_model(
             if diag:
                 h = prefs.max_focus_minutes_per_day / 60
                 ct.only_enforce_if(diag.lit(m, f"cap:{d}", Rule(
-                    "focus_cap", f"Max focus {h:g} h on {d:%a %b} {d.day}", day=d.isoformat())))
+                    "focus_cap", f"Max focus {h:g} h on {fmt.day(d)}", day=d.isoformat())))
     m.add_no_overlap(intervals)
     if diag is None:
         m.maximize(sum(objective))
@@ -451,7 +466,7 @@ def solve(
     blocks.sort(key=lambda b: b.start)
 
     decisions = [
-        EventDecision(e.id, e.title, e.start, e.end, bool(solver.value(built.attend[e.id])), e.skip_cost)
+        EventDecision(e.id, e.title, e.start, e.end, bool(solver.value(built.attend[e.id])), e.skip_cost, e.skip_for)
         for e in events
         if e.id in built.attend
     ]

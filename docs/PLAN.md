@@ -113,7 +113,7 @@ A weekly task is treated as a total task whose deadline is Sunday night, with re
 \text{score} = \sum_{\text{tasks}} w_t \cdot \text{scheduled}_t - \sum_{\text{tasks}} u_t \cdot w_t \cdot \text{unmet}_t - \sum_{\text{events}} c_e \cdot \text{skipped}_e + \sum_{\text{chunks}} \left( b \cdot \text{inPreferredTime} - a \cdot |d - d_{\text{ideal}}| - f \right)
 ```
 
-- w = the task's points per hour, from its priority (priority 5 = 10, priority 1 = 2)
+- w = the task's points per hour, from its priority (priority 1 = 10 at the top, priority 5 = 2)
 - u = urgency, which grows as the deadline nears relative to the work remaining
 - c = the event's skip cost
 - b = bonus for a chunk in the preferred time of day
@@ -124,7 +124,7 @@ A weekly task is treated as a total task whose deadline is Sunday night, with re
 
 ### The midterm example
 
-Study has priority 5, 10 hours remaining, and a Friday 9:00 deadline. Wednesday's lecture has skip cost 4. If free time runs short, using the lecture's 80 minutes for study gains about 13 points versus a loss of 4, so the solver skips the lecture. If free time is plentiful, attending costs nothing, so it keeps the lecture.
+Study has priority 1 (top), 10 hours remaining, and a Friday 9:00 deadline. Wednesday's lecture has skip cost 4. If free time runs short, using the lecture's 80 minutes for study gains about 13 points versus a loss of 4, so the solver skips the lecture. If free time is plentiful, attending costs nothing, so it keeps the lecture.
 
 ### Re-planning ("what now?")
 

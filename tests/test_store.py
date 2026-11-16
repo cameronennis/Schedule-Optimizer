@@ -40,13 +40,13 @@ def at(day, hour, minute=0):
 def test_tasks_survive_restart(db_file):
     eng = db.make_engine(db_file)
     with Session(eng) as session:
-        store.add_task(session, title="Chem midterm", total_minutes=480, priority=5, deadline=at(19, 9))
+        store.add_task(session, title="Chem midterm", total_minutes=480, priority=1, deadline=at(19, 9))
     eng.dispose()
 
     eng = db.make_engine(db_file)  # "restart": brand-new engine on the same file
     with Session(eng) as session:
         [t] = store.list_tasks(session)
-        assert (t.title, t.total_minutes, t.priority) == ("Chem midterm", 480, 5)
+        assert (t.title, t.total_minutes, t.priority) == ("Chem midterm", 480, 1)
         assert t.deadline == at(19, 9)  # time zone survives as the same instant
         assert t.deadline.tzinfo is not None
     eng.dispose()
@@ -158,10 +158,11 @@ def test_event_settings_precedence(s):
         EventInput("e3", "Dentist", at(19, 14), at(19, 15)),
     ]
     assert not any(e.skippable for e in store.apply_event_settings(s, events))  # no defaults
-    store.add_title_rule(s, "lecture", skip_cost=4)
+    store.add_title_rule(s, "lecture", skip_for=2)
     store.set_event_meta(s, "e2", skippable=False)  # this instance stays fixed
     out = {e.id: e for e in store.apply_event_settings(s, events)}
-    assert out["e1"].skippable and out["e1"].skip_cost == 4
+    assert out["e1"].skippable and out["e1"].skip_for == 2
+    assert out["e1"].skip_cost == pytest.approx(7 * 80 / 60)  # 80 min at 7 points/hour (between priorities 2 and 3)
     assert not out["e2"].skippable
     assert not out["e3"].skippable
 
@@ -170,8 +171,8 @@ def test_event_settings_precedence(s):
 
 def test_plan_now_from_database_and_approve(s):
     store.update_prefs(s, max_focus_minutes_per_day=480)
-    mid = store.add_task(s, title="Study for chem midterm", total_minutes=8 * 60, priority=5, deadline=at(19, 9))
-    store.add_title_rule(s, "review session", skip_cost=12)
+    mid = store.add_task(s, title="Study for chem midterm", total_minutes=8 * 60, priority=1, deadline=at(19, 9))
+    store.add_title_rule(s, "review session", skip_for=1)  # only for top-priority work
     events = [
         EventInput("lecture", "Chem lecture (review session)", at(18, 9), at(18, 10, 20)),
         EventInput("lab", "Chem lab", at(18, 13), at(18, 16)),
@@ -218,10 +219,10 @@ def cli_db(tmp_path, monkeypatch):
 
 
 def test_cli_task_lifecycle(cli_db, capsys):
-    cli.main(["task", "add", "Chem midterm", "--hours", "8", "--due", "2026-11-19 09:00", "--priority", "5"])
+    cli.main(["task", "add", "Chem midterm", "--hours", "8", "--due", "2026-11-19 09:00", "--priority", "1"])
     cli.main(["task", "add", "Reading", "--weekly-hours", "3", "--when", "evening"])
     cli.main(["log", "1", "45"])
-    cli.main(["task", "edit", "2", "--priority", "1"])
+    cli.main(["task", "edit", "2", "--priority", "5"])
     capsys.readouterr()
     cli.main(["task", "list"])
     out = capsys.readouterr().out
@@ -251,3 +252,27 @@ def test_cli_offline_plan(cli_db, capsys):
     assert "Essay" in capsys.readouterr().out
     cli.main(["approve", "--no-sync"])
     assert "Approved" in capsys.readouterr().out
+
+
+def test_priority_flip_migration_keeps_meaning(db_file):
+    """Schema v8 flipped priority (1 = top); a v7 file's top-priority 5 becomes 1."""
+    eng = db.make_engine(db_file)
+    with Session(eng) as s:
+        store.add_task(s, title="Was top", total_minutes=60, priority=1)
+        store.add_task(s, title="Was low", total_minutes=60, priority=4)
+    eng.dispose()
+    con = sqlite3.connect(db_file)
+    con.execute("UPDATE task SET priority = 6 - priority")  # how a v7 file stored them
+    con.execute("PRAGMA user_version = 7")
+    con.commit()
+    con.close()
+    eng = db.make_engine(db_file)
+    with Session(eng) as s:
+        assert [(t.title, t.priority) for t in store.list_tasks(s)] == [("Was top", 1), ("Was low", 4)]
+    eng.dispose()
+
+
+def test_priority_one_is_worth_the_most():
+    from schedule_optimizer.domain import priority_to_points_per_hour
+
+    assert [priority_to_points_per_hour(p) for p in range(1, 6)] == [10, 8, 6, 4, 2]

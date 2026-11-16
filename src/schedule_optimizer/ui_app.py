@@ -347,19 +347,28 @@ def now_view() -> None:
         titles = {t.id: t.title for t in store.list_tasks(s, include_done=True)}
         holds = store.list_holds(s, now)
 
-    with ui.row().classes("items-center gap-2"):
-        with ui.dropdown_button("Re-plan", icon="auto_awesome", split=True, auto_close=True,
-                                on_click=lambda: replan()).mark("replan"):
-            ui.item(f"Re-plan, run longer ({store.LONG_SOLVE_SECONDS:g} s)",
-                    on_click=lambda: replan(store.LONG_SOLVE_SECONDS)).mark("replan-long")
-        ui.button("Approve plan", icon="check", on_click=approve).mark("approve") \
-            .props("" if can_approve or holds else "disable") \
-            .tooltip("Saves this plan and writes it, with any breaks, to your Optimizer calendar")
-        ui.button("Log progress", icon="timer", on_click=lambda: open_log_dialog()).props("outline").mark("log")
-        if desktop_setup.is_configured():
-            ui.button("Start a Claude chat", icon="chat", on_click=start_claude_chat).props("outline")
-        ui.label("Using Google Calendar" if _use_google() else "Offline: Google Calendar not used") \
-            .classes("text-sm text-gray-500 ml-2")
+    # The actions sit in an even grid: one row of equal-width buttons, or two rows of two when
+    # the window is narrow (see .now-actions in theme.py). Labels never wrap inside a button.
+    show_chat = desktop_setup.is_configured()
+    with ui.element("div").classes("now-actions-box"):
+        with ui.element("div").classes("now-actions").style(f"--n: {4 if show_chat else 3}"):
+            with ui.dropdown_button("Re-plan", icon="auto_awesome", split=True, auto_close=True,
+                                    on_click=lambda: replan()).mark("replan"):
+                ui.item(f"Re-plan, run longer ({store.LONG_SOLVE_SECONDS:g} s)",
+                        on_click=lambda: replan(store.LONG_SOLVE_SECONDS)).mark("replan-long")
+            ui.button("Approve plan", icon="check", on_click=approve).mark("approve") \
+                .props("" if can_approve or holds else "disable") \
+                .tooltip("Saves this plan and writes it, with any breaks, to your Optimizer calendar")
+            ui.button("Log progress", icon="timer", on_click=lambda: open_log_dialog()).props("outline") \
+                .mark("log")
+            if show_chat:
+                ui.button("Claude chat", icon="chat", on_click=start_claude_chat).props("outline") \
+                    .tooltip("Start a Claude chat: copies the message to paste into Claude Desktop")
+    if not _use_google():
+        with ui.row().classes("items-center gap-2 no-wrap").mark("calendar-offline"):
+            ui.icon("warning", color="warning")
+            ui.label("Not connected to Google Calendar, so plans don't include your events.") \
+                .classes("text-warning text-sm")
 
     if STATE["error"]:
         ui.label(STATE["error"]).classes("text-negative")
@@ -540,49 +549,60 @@ def _send_chat(text: str) -> None:
 @ui.refreshable
 def chat_view() -> None:
     has_key = claude_api.has_key()
-    ui.label("Chat with Claude").classes("text-lg font-medium")
+    with ui.row().classes("w-full items-center justify-between"):
+        ui.label("Chat with Claude").classes("text-lg font-medium")
+        new_chat_slot = ui.row()  # "New chat" goes here once we know a key is set
     note = ui.label("").classes("text-sm text-gray-500").mark("chat-note")
     if not has_key:
         note.text = ("Add an API key in Preferences › Natural Language Input to chat here. "
                      "Everything else works without it.")
-    with ui.column().classes("w-full gap-2"):
+    # The conversation sits in an outlined, rounded panel like the rest of the app.
+    with ui.column().classes("chat-thread w-full"):
+        if not CHAT.log:
+            ui.label("Ask Claude to change your plan, for example to lighten an afternoon or fit in a "
+                     "break. It proposes changes, and you apply them.").classes("text-sm text-gray-500 chat-empty")
         for role, text in CHAT.log:
             if role == "user":
-                ui.chat_message(text, name="You", sent=True)
+                ui.chat_message(text, sent=True).classes("chat-you")
             elif role == "claude":
-                with ui.chat_message(name="Claude"):
+                with ui.chat_message().classes("chat-claude"):
                     ui.markdown(text)
             elif role == "tool":
-                ui.label(text).classes("text-xs text-gray-500 pl-12")
+                with ui.row().classes("items-center gap-1 chat-tool"):
+                    ui.icon("build", size="14px")
+                    ui.label(text)
             else:
-                ui.label(text).classes("text-negative text-sm")
+                with ui.row().classes("items-center gap-1 no-wrap text-negative text-sm"):
+                    ui.icon("error_outline", size="16px")
+                    ui.label(text)
         with db.session() as s:
             mine = [p for p in changes.pending(s) if p.id in CHAT.proposals]
         for p in mine:
             proposal_card(p)
-    with ui.row().classes("w-full items-end no-wrap"):
-        box = ui.textarea(placeholder="e.g. “I'm exhausted, lighten my afternoon”").props("autogrow") \
-            .classes("grow").mark("chat-input")
+    box = ui.textarea(placeholder="e.g. “I'm exhausted, lighten my afternoon”") \
+        .props("outlined autogrow dense").classes("w-full chat-box").mark("chat-input")
 
-        async def send() -> None:
-            text = (box.value or "").strip()
-            if not text:
-                return
-            if not await run.io_bound(claude_api.reachable):
-                note.text = "You're offline, so Claude can't answer right now. Everything else still works."
-                return
-            box.value = ""
-            n = ui.notification("Claude is thinking…", spinner=True, timeout=None)
-            try:
-                await run.io_bound(_send_chat, text)
-            except (claude_api.CapReached, claude_api.NoKey) as e:
-                CHAT.log.append(("error", str(e)))
-            except Exception as e:  # noqa: BLE001 (network, bad key, …)
-                CHAT.log.append(("error", f"Couldn't reach Claude: {e}"))
-            n.dismiss()
-            refresh_all()
+    async def send() -> None:
+        text = (box.value or "").strip()
+        if not text:
+            return
+        if not await run.io_bound(claude_api.reachable):
+            note.text = "You're offline, so Claude can't answer right now. Everything else still works."
+            return
+        box.value = ""
+        n = ui.notification("Claude is thinking…", spinner=True, timeout=None)
+        try:
+            await run.io_bound(_send_chat, text)
+        except (claude_api.CapReached, claude_api.NoKey) as e:
+            CHAT.log.append(("error", str(e)))
+        except Exception as e:  # noqa: BLE001 (network, bad key, …)
+            CHAT.log.append(("error", f"Couldn't reach Claude: {e}"))
+        n.dismiss()
+        refresh_all()
 
-        send_btn = ui.button(icon="send", on_click=send).props("round").mark("chat-send")
+    with box.add_slot("append"):
+        send_btn = ui.button(icon="arrow_upward", on_click=send).props("round dense unelevated") \
+            .classes("chat-send").mark("chat-send")
     if not has_key:
         box.disable()
         send_btn.disable()
@@ -601,7 +621,8 @@ def chat_view() -> None:
             CHAT.proposals.clear()
             chat_view.refresh()
 
-        ui.button("New chat", icon="refresh", on_click=new_chat).props("flat dense")
+        with new_chat_slot:
+            ui.button("New chat", icon="add", on_click=new_chat).props("flat dense")
 
     with ui.expansion("Claude Desktop Chat Input").classes("w-full text-sm text-gray-600 mt-4") \
             .mark("claude-desktop-section"):
